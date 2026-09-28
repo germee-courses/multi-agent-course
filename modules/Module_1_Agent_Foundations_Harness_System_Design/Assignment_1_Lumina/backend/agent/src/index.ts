@@ -39,9 +39,32 @@
 import express from 'express';
 import pino from 'pino';
 import { mkdirSync } from 'node:fs';
-import { HealthResponse, ROUTES } from '@lumina/contract';
+import type { ZodError } from 'zod';
+import {
+  AskBody,
+  CreateThreadBody,
+  HealthResponse,
+  REQUEST_HEADER,
+  ROUTES,
+  USER_HEADER,
+  newId,
+  type Terminated
+} from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
+import { Sse } from './sse.js';
+import { runQuickAnswer } from './loop.js';
+import {
+  createThread,
+  findThread,
+  getThread,
+  listThreads,
+  loadHistory,
+  saveAnswer,
+  saveUserMessage
+} from './threads.js';
+import { deleteMemory, listMemories } from './memory.js';
+import { RunState, writeRunLog } from './runlog.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -68,6 +91,139 @@ app.get('/health', async (_req, res) => {
     ai: { status: 'ok' }
   };
   res.status(dbStatus === 'ok' ? 200 : 503).json(body);
+});
+
+// ---------------------------------------------------------------- threads + ask (steps 1–3)
+
+const fail = (res: express.Response, status: number, error: string) =>
+  res.status(status).json({ error, status });
+
+/** "query: Required" rather than a bare "Required". */
+const zodMessage = (err: ZodError) => {
+  const issue = err.issues[0];
+  return issue ? `${issue.path.join('.') || 'body'}: ${issue.message}` : 'invalid body';
+};
+
+app.post('/threads', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    const body = CreateThreadBody.safeParse(req.body ?? {});
+    if (!body.success) return fail(res, 400, zodMessage(body.error));
+    res.status(201).json({ threadId: await createThread(userId, body.data.title) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/threads', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    res.json(await listThreads(userId));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/threads/:threadId', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    const thread = await findThread(req.params.threadId, userId);
+    if (!thread) return fail(res, 404, `unknown thread ${req.params.threadId}`);
+    res.json(await getThread(thread));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/threads/:threadId/ask', async (req, res) => {
+  const requestId = req.header(REQUEST_HEADER) ?? newId('req');
+  const userId = req.header(USER_HEADER);
+  if (!userId) return fail(res, 401, 'X-User-Id header is required');
+  const body = AskBody.safeParse(req.body);
+  if (!body.success) return fail(res, 400, zodMessage(body.error));
+
+  const { query, depth, mode } = body.data;
+  // Not built yet. An honest 501 beats quietly running a quick web search instead.
+  if (depth === 'deep') return fail(res, 501, 'not implemented yet: deep search');
+  if (mode === 'docs') return fail(res, 501, 'not implemented yet: document search');
+
+  const sse = new Sse(res);
+  // The run's tally lives out here so the run log survives the loop throwing. `run` stays
+  // null until an answer actually starts: a 404 is a rejected request, not a run.
+  let run: RunState | null = null;
+  let terminated: Terminated = 'error';
+  let answerId: string | undefined;
+  try {
+    const thread = await findThread(req.params.threadId, userId);
+    if (!thread) return fail(res, 404, `unknown thread ${req.params.threadId}`);
+
+    // History first (so it does not include this question), then record the question.
+    const history = await loadHistory(thread._id, userId);
+    await saveUserMessage(thread, query);
+
+    run = new RunState();
+    const r = await runQuickAnswer({ query, history, userId, threadId: thread._id }, sse, run);
+    terminated = r.terminated;
+    answerId = r.answerId;
+    // The answer is saved only once it finished (done or an honest cap). A run that threw
+    // saves nothing: a half-streamed answer must not come back as if it were complete.
+    await saveAnswer(thread, { content: r.content, sources: r.sources, done: r.done });
+    log.info(
+      {
+        requestId,
+        userId,
+        toolCalls: r.toolCalls.length,
+        terminated: r.terminated,
+        tokens: r.tokens,
+        costUsd: r.costUsd,
+        searchCached: r.searchCached,
+        ttftMs: r.ttftMs,
+        latencyMs: r.latencyMs
+      },
+      'answer'
+    );
+  } catch (err) {
+    // Fail loud. Before anything has streamed this is a real HTTP 502; once the 200 stream
+    // is open, it is an SSE error event carrying 502. Never a plausible answer.
+    const error = (err instanceof Error ? err.message : String(err)).trim() || 'upstream failure';
+    log.error({ requestId, userId, terminated: 'error', toolCalls: run?.toolCalls.length ?? 0, err }, 'answer failed');
+    if (sse.started) sse.send('error', { status: 502, error });
+    else if (!res.headersSent) res.status(502).json({ error, status: 502, requestId });
+  } finally {
+    sse.end();
+    // After the stream has closed, so writing the log never delays the user.
+    if (run) {
+      await writeRunLog(run, { requestId, userId, threadId: req.params.threadId, query, terminated, depth: 'quick', answerId });
+    }
+  }
+});
+
+// ---------------------------------------------------------------- memory (step 4)
+
+app.get('/memory', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    res.json(await listMemories(userId));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/memory/:memoryId', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    if (!(await deleteMemory(userId, req.params.memoryId))) {
+      return fail(res, 404, `unknown memory ${req.params.memoryId}`);
+    }
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ---------------------------------------------------------------- everything else: 501

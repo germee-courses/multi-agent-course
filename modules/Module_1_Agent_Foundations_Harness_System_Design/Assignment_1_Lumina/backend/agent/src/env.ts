@@ -25,6 +25,14 @@ export const env = {
 
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
 
+  // What an answer costs, so `done.costUsd` is measured rather than guessed. The defaults
+  // are gpt-4.1-mini's published rates at the time of writing — check your provider's
+  // pricing page and override in .env if they have changed or you switch model.
+  llmInputUsdPerMtok: num(process.env.LLM_INPUT_USD_PER_MTOK, 0.4),
+  llmOutputUsdPerMtok: num(process.env.LLM_OUTPUT_USD_PER_MTOK, 1.6),
+  searchUsdPerCall: num(process.env.SEARCH_USD_PER_CALL, 0.008),
+  embeddingUsdPerMtok: num(process.env.EMBEDDING_USD_PER_MTOK, 0.02),
+
   // Deep search is the expensive gear, so its limits are configuration, not code.
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
   deepSubQuestionsMax: num(process.env.DEEP_SUB_QUESTIONS_MAX, 6),
