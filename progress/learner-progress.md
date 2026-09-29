@@ -53,8 +53,13 @@ Status values: not started · in progress · completed · needs review
 - Learner learned: 202 + worker keeps the single Node thread free for streaming; atomic claim prevents two workers doing the same job (answered correctly).
 - Network: learner's public IP changes (180.190.169.191 → 112.201.107.157); Atlas SSL alert 80 = IP not on access list. On slow network Atlas ping 150–330 ms → upload 3–12 s. Recheck upload < 300 ms on a stable connection.
 
+- 2026-09-29: Step 7 (hybrid RAG + router) built: src/tools/documents.ts ($vectorSearch + chunks_text BM25 in parallel, both filtered by spaceId+userId inside the stage, RRF k=60, similarity gate, dedupe identical passages, top 5; no re-rank, reason in code comment), router in loop.ts (web | docs = search_documents forced on turn 1 | auto = model picks from Space file list, reason in trace), doc sources numbered by rank with locator + whole chunk as snippet; 400 docs w/o spaceId, 404 other user's space. Config in env.ts (DOC_TOP_K, DOC_CANDIDATES, RRF_K, DOC_MIN_VECTOR_SCORE=0.62).
+- Calibration: on-topic top hits 0.67–0.86, off-topic 0.50–0.56 → floor 0.62 (0.7 would have dropped the k1 answer).
+- Verified: docs k1 → [1] retrieval-basics.pdf p.1, "1.2 [1]"; auto churn → model chose docs ("likely documented in our own materials"), cites note.md § Churn plan; off-topic → searched twice, no sources, "could not find". Latency 17–71 s = network (OpenAI unreachable within 10 s at the time), not code.
+- Learner learned: BM25 catches exact rare tokens (k1); vectors catch synonyms (car/automobile); RRF fuses ranks because scores aren't comparable.
+
 ## Next step
-- Step 7: search_documents tool (hybrid: $vectorSearch + chunks_text BM25, RRF, spaceId filter inside $vectorSearch) + router mode auto; doc citations `file, p. N`.
-- Recheck upload latency (< 300 ms) on a stable network.
-- Consider adding to DESIGN.md: recall_memory run by harness every answer (design choice).
+- Run `npm run bench` on a stable network: recall@5 ≥ 0.70 over 39 gold questions, routerPicksDocs, pageLocator, 202 p95 < 300 ms.
+- DESIGN.md (learner's voice): (1) recall_memory run by harness every answer; (2) why no re-rank step (small Space, RRF baseline, TTFT already over budget; revisit if recall@5 < 0.70).
+- Then step 8: deep search (plan_research + plan event before retrieval).
 - Optional later: Module 1 quiz; reconciliation agent build.

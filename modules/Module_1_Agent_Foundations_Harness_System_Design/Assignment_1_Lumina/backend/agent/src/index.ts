@@ -149,10 +149,10 @@ app.post('/threads/:threadId/ask', async (req, res) => {
   const body = AskBody.safeParse(req.body);
   if (!body.success) return fail(res, 400, zodMessage(body.error));
 
-  const { query, depth, mode } = body.data;
+  const { query, depth, mode, spaceId } = body.data;
   // Not built yet. An honest 501 beats quietly running a quick web search instead.
   if (depth === 'deep') return fail(res, 501, 'not implemented yet: deep search');
-  if (mode === 'docs') return fail(res, 501, 'not implemented yet: document search');
+  if (mode === 'docs' && !spaceId) return fail(res, 400, 'spaceId: required when mode is docs');
 
   const sse = new Sse(res);
   // The run's tally lives out here so the run log survives the loop throwing. `run` stays
@@ -163,13 +163,15 @@ app.post('/threads/:threadId/ask', async (req, res) => {
   try {
     const thread = await findThread(req.params.threadId, userId);
     if (!thread) return fail(res, 404, `unknown thread ${req.params.threadId}`);
+    // Another user's Space is "not found", exactly like their thread.
+    if (spaceId && !(await findSpace(spaceId, userId))) return fail(res, 404, `unknown space ${spaceId}`);
 
     // History first (so it does not include this question), then record the question.
     const history = await loadHistory(thread._id, userId);
     await saveUserMessage(thread, query);
 
     run = new RunState();
-    const r = await runQuickAnswer({ query, history, userId, threadId: thread._id }, sse, run);
+    const r = await runQuickAnswer({ query, history, userId, threadId: thread._id, mode, spaceId }, sse, run);
     terminated = r.terminated;
     answerId = r.answerId;
     // The answer is saved only once it finished (done or an honest cap). A run that threw

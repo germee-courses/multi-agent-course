@@ -4,7 +4,14 @@ import type {
   ChatCompletionMessageToolCall,
   ChatCompletionTool
 } from 'openai/resources/chat/completions';
-import { newId, type DoneEvent, type Source, type Terminated, type ToolName } from '@lumina/contract';
+import {
+  newId,
+  type AskMode,
+  type DoneEvent,
+  type Source,
+  type Terminated,
+  type ToolName
+} from '@lumina/contract';
 import { env, secrets } from './env.js';
 import type { Sse } from './sse.js';
 import { ProviderError, type SearchResult } from './tools/search.js';
@@ -12,6 +19,7 @@ import { cachedSearch } from './cache.js';
 import type { Turn } from './threads.js';
 import { recallMemory, saveMemory } from './memory.js';
 import { fetchPage, type FetchedPage } from './tools/fetch.js';
+import { searchDocuments, spaceContents, type DocHit } from './tools/documents.js';
 import type { RunState, ToolCallRecord } from './runlog.js';
 
 /**
@@ -28,8 +36,10 @@ import type { RunState, ToolCallRecord } from './runlog.js';
  * propagates to the route, which turns it into a 502. A page that will not load is
  * different — that is one failed tool step (ok:false + error) and the loop carries on.
  *
- * Quick search is offered web_search, fetch_page and save_memory. plan_research is not in
- * the tool list at all, so no prompt, however persuasive, can make a quick run escalate.
+ * Quick search is offered web_search, fetch_page and save_memory, plus search_documents
+ * when the request names a Space (mode auto or docs). mode docs offers ONLY
+ * search_documents and forces it on the first turn. plan_research is not in the tool list
+ * at all, so no prompt, however persuasive, can make a quick run escalate.
  */
 
 export interface AskContext {
@@ -37,7 +47,21 @@ export interface AskContext {
   history: Turn[];
   userId: string;
   threadId: string;
+  mode: AskMode;
+  /** Already checked to belong to userId by the route. */
+  spaceId?: string;
 }
+
+type SpaceContents = Awaited<ReturnType<typeof spaceContents>>;
+
+/** What this request may search, decided once from `mode` and whether a Space was given. */
+interface Route {
+  tools: 'web' | 'docs' | 'both';
+  space?: SpaceContents;
+}
+
+/** One piece of retrieved evidence, in the order it arrived. Sources are numbered from this. */
+type Evidence = { kind: 'web'; page: FetchedPage } | { kind: 'doc'; hit: DocHit };
 
 export interface AnswerResult {
   answerId: string;
@@ -53,6 +77,25 @@ export interface AnswerResult {
   sources: Source[];
   done: DoneEvent;
 }
+
+const SEARCH_DOCUMENTS_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'search_documents',
+    description:
+      "Search the user's uploaded documents in this Space (hybrid: meaning + exact words). " +
+      'Returns the best-matching passages with their file and page or heading.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: "A focused query, using the words the document itself would use." },
+        reason: { type: 'string', description: 'One short sentence: why the documents (this is the routing decision).' }
+      },
+      required: ['query', 'reason'],
+      additionalProperties: false
+    }
+  }
+};
 
 const QUICK_TOOLS: ChatCompletionTool[] = [
   {
@@ -108,11 +151,42 @@ const QUICK_TOOLS: ChatCompletionTool[] = [
   }
 ];
 
-const RESEARCH_PROMPT = (maxCalls: number, known: string) => `You are the research step of LUMINA, an answer engine. Gather evidence; do not answer.
-Call web_search with a focused query, then fetch_page on the 2-4 most relevant results (prefer primary and reputable sources; fetch several in one turn when you can).
+const WEB_ROUTE =
+  'Call web_search with a focused query, then fetch_page on the 2-4 most relevant results (prefer primary and reputable sources; fetch several in one turn when you can).';
+
+/**
+ * Where to look. `docs` and `web` are the user's decision; `auto` is the model's, made from
+ * the question and the Space's file list, and its reason lands in the trace.
+ */
+function routeInstructions(route: Route): string {
+  const files = route.space ? spaceList(route.space) : '';
+  if (route.tools === 'web') return WEB_ROUTE;
+  if (route.tools === 'docs') {
+    return (
+      `Answer from the user's documents only. Call search_documents with a focused query.${files}\n` +
+      'If the passages do not cover the question, search once more with different wording (the terms the document would use). Never use the web.'
+    );
+  }
+  return (
+    `Decide where the answer lives.${files}\n` +
+    '- About the content of these documents, or the user\'s own material ("we", "our", "the report"): call search_documents.\n' +
+    '- Current events, prices, or general knowledge the documents would not hold: ' + WEB_ROUTE + '\n' +
+    '- If the question needs both (e.g. "what did we commit to, and what does the market say?"), do both.\n' +
+    "Every tool call's reason states this routing decision in a few words."
+  );
+}
+
+function spaceList(space: SpaceContents): string {
+  const ready = space.indexed.length ? `\nThe user's Space holds: ${space.indexed.join(', ')}.` : "\nThe user's Space has no indexed documents yet.";
+  const waiting = space.notReady.length ? ` Still being indexed (not searchable yet): ${space.notReady.join(', ')}.` : '';
+  return ready + waiting;
+}
+
+const RESEARCH_PROMPT = (maxCalls: number, known: string, route: Route) => `You are the research step of LUMINA, an answer engine. Gather evidence; do not answer.
+${routeInstructions(route)}
 Earlier turns of the conversation may come first: resolve words like "it" or "that" from them and search for the full topic, not the literal follow-up words.
 If the user states a lasting fact or preference about themselves, call save_memory once for it. If the message only tells you something about the user and asks nothing, save it and reply DONE without searching.
-Search again only if the first results are off-topic. Stop calling tools as soon as the fetched pages cover the question, and reply with the single word DONE.
+Search again only if the first results are off-topic. Stop calling tools as soon as the evidence covers the question, and reply with the single word DONE.
 Every tool call needs a one-sentence reason. Hard limit: ${maxCalls} tool calls in total.${known}`;
 
 const ANSWER_PROMPT = (o: {
@@ -180,9 +254,13 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
   const { toolCalls, tokens } = run;
   const addUsage = (u?: { prompt_tokens?: number; completion_tokens?: number } | null) => run.addUsage(u);
 
-  const pages: FetchedPage[] = [];
+  const evidence: Evidence[] = [];
   const saved: string[] = [];
+  let retrieved = false;
   let terminated: Terminated = 'done';
+
+  // The Space's file list is what `auto` routes on; fetch it while memory is recalled.
+  const spaceLookup = ctx.spaceId ? spaceContents(ctx.spaceId, ctx.userId) : Promise.resolve(undefined);
 
   // ------------------------------------------------------------- recall: always, by the harness
   const recallStarted = Date.now();
@@ -211,14 +289,22 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
   });
   const known = knownAboutUser(recalled);
 
+  // ------------------------------------------------------------- route: which tools, from mode
+  const space = await spaceLookup;
+  const route: Route = {
+    tools: ctx.mode === 'docs' ? 'docs' : ctx.mode === 'auto' && ctx.spaceId ? 'both' : 'web',
+    space
+  };
+  const tools = toolsFor(route.tools);
+
   // ------------------------------------------------------------- research: the loop
   const messages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: RESEARCH_PROMPT(env.maxToolCalls, known) },
+    { role: 'system', content: RESEARCH_PROMPT(env.maxToolCalls, known, route) },
     ...history,
     { role: 'user', content: query }
   ];
 
-  for (;;) {
+  for (let turn = 1; ; turn++) {
     if (Date.now() >= deadline) {
       terminated = 'cap';
       break;
@@ -226,8 +312,13 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     const completion = await llm().chat.completions.create({
       model: env.llmModel,
       messages,
-      tools: QUICK_TOOLS,
-      tool_choice: 'auto',
+      tools,
+      // mode docs is the user saying "answer from my documents": the first move is not the
+      // model's to skip. After that it may search again or stop.
+      tool_choice:
+        route.tools === 'docs' && turn === 1
+          ? { type: 'function', function: { name: 'search_documents' } }
+          : 'auto',
       temperature: 0
     });
     addUsage(completion.usage);
@@ -241,7 +332,7 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
       break;
     }
     const batch = requested.slice(0, room);
-    const outcomes = await Promise.allSettled(batch.map((call) => runTool(call, ctx)));
+    const outcomes = await Promise.allSettled(batch.map((call) => runTool(call, ctx, tools)));
 
     messages.push(msg);
     for (const [i, call] of batch.entries()) {
@@ -264,8 +355,15 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
       if (r.searched) run.searches += 1;
       if (r.cached) run.cacheHits += 1;
       if (r.saved) saved.push(r.saved);
+      if (r.searched || r.hits) retrieved = true;
       run.embeddingTokens += r.embeddingTokens ?? 0;
-      if (r.page && !pages.some((p) => p.url === r.page!.url)) pages.push(r.page);
+      const page = r.page;
+      if (page && !evidence.some((e) => e.kind === 'web' && e.page.url === page.url)) {
+        evidence.push({ kind: 'web', page });
+      }
+      for (const hit of r.hits ?? []) {
+        if (!evidence.some((e) => e.kind === 'doc' && e.hit.chunkId === hit.chunkId)) evidence.push({ kind: 'doc', hit });
+      }
       messages.push({ role: 'tool', tool_call_id: call.id, content: r.forModel });
     }
 
@@ -276,17 +374,28 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
   }
 
   // ------------------------------------------------------------- answer: sources, then tokens
-  const sources: Source[] = pages.map((p, i) => ({
-    n: i + 1,
-    kind: 'web',
-    title: p.title,
-    url: p.url,
-    snippet: pickSnippet(p.text, query)
-  }));
+  // Numbered in the order retrieved, so a document search's best passage is its lowest [n].
+  const sources: Source[] = evidence.map((e, i): Source =>
+    e.kind === 'web'
+      ? { n: i + 1, kind: 'web', title: e.page.title, url: e.page.url, snippet: pickSnippet(e.page.text, query) }
+      : {
+          n: i + 1,
+          kind: 'doc',
+          title: e.hit.title,
+          docId: e.hit.docId as Source['docId'],
+          locator: e.hit.locator,
+          // The whole chunk: it IS the retrieved passage, verbatim, so it is what grounds the claim.
+          snippet: e.hit.text
+        }
+  );
   sse.send('sources', sources);
 
-  const context = pages
-    .map((p, i) => `[${i + 1}] ${p.title}\n${p.url}\n${p.text.slice(0, PAGE_CHARS_FOR_ANSWER)}`)
+  const context = evidence
+    .map((e, i) =>
+      e.kind === 'web'
+        ? `[${i + 1}] ${e.page.title}\n${e.page.url}\n${e.page.text.slice(0, PAGE_CHARS_FOR_ANSWER)}`
+        : `[${i + 1}] ${e.hit.title}, ${locatorLabel(e.hit.locator)}\n${e.hit.text}`
+    )
     .join('\n\n');
 
   const stream = await llm().chat.completions.create({
@@ -297,7 +406,7 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     messages: [
       {
         role: 'system',
-        content: ANSWER_PROMPT({ sourceCount: sources.length, terminated, known, saved, searched: run.searches > 0 })
+        content: ANSWER_PROMPT({ sourceCount: sources.length, terminated, known, saved, searched: retrieved })
       },
       ...history,
       { role: 'user', content: `Question: ${query}\n\nSources:\n${context || '(none)'}` }
@@ -370,6 +479,21 @@ interface ToolOutcome {
   saved?: string;
   embeddingTokens?: number;
   page?: FetchedPage;
+  /** search_documents' passages, best first. Present (possibly empty) whenever it ran. */
+  hits?: DocHit[];
+}
+
+function toolsFor(route: Route['tools']): ChatCompletionTool[] {
+  if (route === 'web') return QUICK_TOOLS;
+  const saveMemoryTool = QUICK_TOOLS.filter((t) => t.function.name === 'save_memory');
+  return route === 'docs' ? [SEARCH_DOCUMENTS_TOOL, ...saveMemoryTool] : [SEARCH_DOCUMENTS_TOOL, ...QUICK_TOOLS];
+}
+
+/** `p. 14`, `§ Pricing`, `line 40`: how a document citation says where it is. */
+function locatorLabel(l: DocHit['locator']): string {
+  if (l.page !== undefined) return `p. ${l.page}`;
+  if (l.heading !== undefined) return `§ ${l.heading}`;
+  return `line ${l.line}`;
 }
 
 /**
@@ -377,10 +501,42 @@ interface ToolOutcome {
  * page that will not load is caught and reported as a failed step, because the loop can
  * carry on without it.
  */
-async function runTool(call: ChatCompletionMessageToolCall, ctx: AskContext): Promise<ToolOutcome> {
+async function runTool(
+  call: ChatCompletionMessageToolCall,
+  ctx: AskContext,
+  offered: ChatCompletionTool[]
+): Promise<ToolOutcome> {
   const t0 = Date.now();
   const { input, reason, bad } = safeArgs(call);
   if (bad) return { ok: false, error: bad, ms: 0, input, reason, forModel: `Error: ${bad}` };
+  // A model can name a tool it was not given. The route decided; the harness enforces it.
+  if (!offered.some((t) => t.function.name === call.function.name)) {
+    const error = `tool ${call.function.name} is not available for mode ${ctx.mode}`;
+    return { ok: false, error, ms: 0, input, reason, forModel: `Error: ${error}` };
+  }
+
+  if (call.function.name === 'search_documents') {
+    if (!ctx.spaceId) {
+      const error = 'search_documents needs a spaceId on the request';
+      return { ok: false, error, ms: 0, input, reason, forModel: `Error: ${error}` };
+    }
+    // Embedding or Atlas failures throw: an empty list here must mean "nothing matched",
+    // never "the search broke".
+    const { hits, embeddingTokens } = await searchDocuments(ctx.spaceId, ctx.userId, String(input.query ?? ''));
+    return {
+      ok: true,
+      ms: Date.now() - t0,
+      input,
+      reason,
+      hits,
+      embeddingTokens,
+      forModel: hits.length
+        ? hits
+            .map((h, i) => `${i + 1}. ${h.title}, ${locatorLabel(h.locator)} (similarity ${h.similarity})\n   ${h.text.slice(0, 500)}`)
+            .join('\n')
+        : 'No passage in this Space matches. Try one different wording, or stop and reply DONE.'
+    };
+  }
 
   if (call.function.name === 'web_search') {
     const { results, cached } = await cachedSearch(String(input.query));
@@ -429,7 +585,7 @@ async function runTool(call: ChatCompletionMessageToolCall, ctx: AskContext): Pr
     };
   }
 
-  const error = `tool ${call.function.name} is not available in a quick search`;
+  const error = `tool ${call.function.name} is not implemented`;
   return { ok: false, error, ms: 0, input, reason, forModel: `Error: ${error}` };
 }
 

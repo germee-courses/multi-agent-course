@@ -58,6 +58,22 @@ export const env = {
   /** How long the read-your-write probe waits for Atlas to make a new chunk searchable. */
   probeTimeoutSec: num(process.env.PROBE_TIMEOUT_SEC, 60),
 
+  // Document retrieval (search_documents). Hybrid: vector + BM25, fused by reciprocal rank.
+  /** Passages one search_documents call returns, best first. recall@5 reads the top 5. */
+  docTopK: num(process.env.DOC_TOP_K, 5),
+  /** How deep each retriever looks before fusion. More candidates, better fusion, more latency. */
+  docCandidates: num(process.env.DOC_CANDIDATES, 20),
+  /** RRF's k: score = Σ 1/(k + rank). 60 is the value from the original RRF paper. */
+  rrfK: num(process.env.RRF_K, 60),
+  /**
+   * Relevance floor, applied to every fused passage: its similarity to the question (Atlas's
+   * cosine score, (1 + cos) / 2, so 0.5 = unrelated and 1 = identical) must reach this, so an
+   * off-topic question retrieves nothing rather than the Space's least-bad chunks. BM25 alone
+   * cannot be the gate: "what" and "the" are words too. Calibrated 2026-09-29 on the gold
+   * corpus: on-topic top hits scored 0.67–0.86, off-topic questions 0.50–0.56.
+   */
+  docMinVectorScore: num(process.env.DOC_MIN_VECTOR_SCORE, 0.62),
+
   logLevel: process.env.LOG_LEVEL ?? 'info',
   /** Where the per-answer run logs land. quality/check.mjs reads this folder. */
   runsDir: resolve(process.cwd(), '../../runs')
