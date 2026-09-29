@@ -46,8 +46,15 @@ Status values: not started · in progress · completed · needs review
 - Learner learned: every run logs (done/cap/error); SEARCH_PROVIDER picks one provider, no fallback; cache can mask a dead key.
 - Known gap: TTFT ~14.5s / latency ~15s vs SLA 2.5s / 12s — tune later.
 - Learner prefers: teacher's build order, with teaching aids (diagram + check question) per step. Learner supervises; Claude writes code.
+- 2026-09-29: Repo pushed to private github.com/germee-courses/multi-agent-course (remote `germee`; `origin` = teacher, pull with `git pull origin main`). Merged teacher's 6 new commits cleanly.
+- 2026-09-29: Step 6a (Spaces + upload) built: src/spaces.ts; POST/GET /spaces, POST /spaces/:id/documents (multer memory, 25 MB → 413, pdf/md/txt by MIME or extension → else 400, GridFS → pending doc → job, 202), GET /spaces/:id/documents. Verified 401/404 (other user)/400/413; 202 in ~206 ms on good network.
+- 2026-09-29: Step 6b (jobs worker) built: src/ingest.ts (pdfjs page-aware; md by heading; txt by line; ~1200-char chunks, 150 overlap, never cross a locator), embedMany in memory.ts, src/worker.ts (atomic claim, heartbeat claimedAt, sweeper w/ max attempts, resume via chunk ids `<docId>_<ord>`, read-your-write probe, fail loud). Config in env.ts. Verified: md + gold PDF (4 pages → 9 chunks, page locators); probe waited 4.5–17.8 s (eventual consistency is real); kill -9 mid-embedding → sweeper returned job → attempt 2 reused 4/7 chunks → indexed.
+- Fixed kit bug in db.ts: failed first connect cached a closed client ("Topology is closed" forever). Tell instructor.
+- Learner learned: 202 + worker keeps the single Node thread free for streaming; atomic claim prevents two workers doing the same job (answered correctly).
+- Network: learner's public IP changes (180.190.169.191 → 112.201.107.157); Atlas SSL alert 80 = IP not on access list. On slow network Atlas ping 150–330 ms → upload 3–12 s. Recheck upload < 300 ms on a stable connection.
 
 ## Next step
-- Step 6: Spaces + jobs worker (upload → GridFS → 202 → parse → chunk → embed → probe → indexed). Remember: learner chose separate `npm run worker` process.
+- Step 7: search_documents tool (hybrid: $vectorSearch + chunks_text BM25, RRF, spaceId filter inside $vectorSearch) + router mode auto; doc citations `file, p. N`.
+- Recheck upload latency (< 300 ms) on a stable network.
 - Consider adding to DESIGN.md: recall_memory run by harness every answer (design choice).
 - Optional later: Module 1 quiz; reconciliation agent build.

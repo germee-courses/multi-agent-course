@@ -37,13 +37,16 @@
  *     that escalates itself is a product with an unbounded bill.
  */
 import express from 'express';
+import multer from 'multer';
 import pino from 'pino';
 import { mkdirSync } from 'node:fs';
 import type { ZodError } from 'zod';
 import {
   AskBody,
+  CreateSpaceBody,
   CreateThreadBody,
   HealthResponse,
+  MAX_UPLOAD_BYTES,
   REQUEST_HEADER,
   ROUTES,
   USER_HEADER,
@@ -65,6 +68,7 @@ import {
 } from './threads.js';
 import { deleteMemory, listMemories } from './memory.js';
 import { RunState, writeRunLog } from './runlog.js';
+import { acceptedType, createSpace, findSpace, listDocuments, listSpaces, uploadDocument } from './spaces.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -221,6 +225,69 @@ app.delete('/memory/:memoryId', async (req, res, next) => {
       return fail(res, 404, `unknown memory ${req.params.memoryId}`);
     }
     res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------- spaces + upload (step 6a)
+
+app.post('/spaces', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    const body = CreateSpaceBody.safeParse(req.body ?? {});
+    if (!body.success) return fail(res, 400, zodMessage(body.error));
+    res.status(201).json(await createSpace(userId, body.data.name));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/spaces', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    res.json(await listSpaces(userId));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The file is held in memory only long enough to hand it to GridFS; 25 MB is the ceiling.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 } });
+
+app.post('/spaces/:spaceId/documents', (req, res, next) => {
+  const userId = req.header(USER_HEADER);
+  if (!userId) return fail(res, 401, 'X-User-Id header is required');
+  upload.single('file')(req, res, async (uploadErr: unknown) => {
+    try {
+      if (uploadErr instanceof multer.MulterError) {
+        if (uploadErr.code === 'LIMIT_FILE_SIZE') return fail(res, 413, 'file is larger than 25 MB');
+        return fail(res, 400, `upload: ${uploadErr.message}`);
+      }
+      if (uploadErr) throw uploadErr;
+      if (!req.file) return fail(res, 400, 'file: a multipart field named "file" is required');
+      const mimeType = acceptedType(req.file);
+      if (!mimeType) return fail(res, 400, `file: ${req.file.originalname} is not a PDF, Markdown, or text file`);
+
+      const space = await findSpace(req.params.spaceId, userId);
+      if (!space) return fail(res, 404, `unknown space ${req.params.spaceId}`);
+
+      const docId = await uploadDocument(space, req.file, mimeType);
+      res.status(202).json({ docId, status: 'pending' });
+    } catch (err) {
+      next(err);
+    }
+  });
+});
+
+app.get('/spaces/:spaceId/documents', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    if (!(await findSpace(req.params.spaceId, userId))) return fail(res, 404, `unknown space ${req.params.spaceId}`);
+    res.json(await listDocuments(req.params.spaceId, userId));
   } catch (err) {
     next(err);
   }

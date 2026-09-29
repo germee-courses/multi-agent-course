@@ -45,6 +45,19 @@ export const env = {
   maxToolCallsDeep: num(process.env.MAX_TOOL_CALLS_DEEP, 24),
   maxWallClockSecDeep: num(process.env.MAX_WALL_CLOCK_SEC_DEEP, 240),
 
+  // Ingestion (the jobs worker). Chunks never cross a page or heading, so each one has a
+  // single locator; the overlap keeps a sentence split at a boundary findable from both sides.
+  chunkChars: num(process.env.CHUNK_CHARS, 1200),
+  chunkOverlapChars: num(process.env.CHUNK_OVERLAP_CHARS, 150),
+  embedBatchSize: num(process.env.EMBED_BATCH_SIZE, 64),
+  workerPollMs: num(process.env.WORKER_POLL_MS, 1000),
+  /** A `running` job whose claimedAt is older than this is presumed dead and swept back. */
+  jobStaleSec: num(process.env.JOB_STALE_SEC, 300),
+  /** A job that has crashed a worker this many times is failed, not retried forever. */
+  jobMaxAttempts: num(process.env.JOB_MAX_ATTEMPTS, 3),
+  /** How long the read-your-write probe waits for Atlas to make a new chunk searchable. */
+  probeTimeoutSec: num(process.env.PROBE_TIMEOUT_SEC, 60),
+
   logLevel: process.env.LOG_LEVEL ?? 'info',
   /** Where the per-answer run logs land. quality/check.mjs reads this folder. */
   runsDir: resolve(process.cwd(), '../../runs')

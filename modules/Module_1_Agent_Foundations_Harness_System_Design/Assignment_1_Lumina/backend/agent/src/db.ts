@@ -7,8 +7,12 @@ let client: MongoClient | null = null;
 export async function db(): Promise<Db> {
   if (!env.mongoUri) throw new Error('MONGODB_URI is not set — copy .env.example to .env');
   if (!client) {
-    client = new MongoClient(env.mongoUri, { serverSelectionTimeoutMS: 5000 });
-    await client.connect();
+    // Cache the client only once it has connected: a failed first connect would otherwise
+    // leave a closed client here, and every later call fails with "Topology is closed"
+    // even after the network comes back.
+    const fresh = new MongoClient(env.mongoUri, { serverSelectionTimeoutMS: 5000 });
+    await fresh.connect();
+    client = fresh;
   }
   return client.db(env.mongoDb);
 }

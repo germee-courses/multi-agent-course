@@ -46,6 +46,16 @@ export async function embed(text: string): Promise<{ vector: number[]; tokens: n
   return { vector, tokens: res.usage?.prompt_tokens ?? 0 };
 }
 
+/** Many embeddings in one call (the worker's batch path). Order matches `texts`. */
+export async function embedMany(texts: string[]): Promise<{ vectors: number[][]; tokens: number }> {
+  const res = await openai().embeddings.create({ model: env.embeddingModel, input: texts });
+  const vectors = [...res.data].sort((a, b) => a.index - b.index).map((d) => d.embedding);
+  if (vectors.length !== texts.length) {
+    throw new ProviderError('openai', `asked for ${texts.length} embeddings, got ${vectors.length}`);
+  }
+  return { vectors, tokens: res.usage?.prompt_tokens ?? 0 };
+}
+
 export interface RecalledMemory {
   id: string;
   text: string;
