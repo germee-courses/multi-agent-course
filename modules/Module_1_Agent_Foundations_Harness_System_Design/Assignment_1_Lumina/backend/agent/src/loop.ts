@@ -7,6 +7,7 @@ import type {
 import {
   newId,
   type AskMode,
+  type Depth,
   type DoneEvent,
   type Source,
   type Terminated,
@@ -52,16 +53,19 @@ export interface AskContext {
   spaceId?: string;
 }
 
-type SpaceContents = Awaited<ReturnType<typeof spaceContents>>;
+export type SpaceContents = Awaited<ReturnType<typeof spaceContents>>;
 
 /** What this request may search, decided once from `mode` and whether a Space was given. */
-interface Route {
+export interface Route {
   tools: 'web' | 'docs' | 'both';
   space?: SpaceContents;
 }
 
-/** One piece of retrieved evidence, in the order it arrived. Sources are numbered from this. */
-type Evidence = { kind: 'web'; page: FetchedPage } | { kind: 'doc'; hit: DocHit };
+/**
+ * One piece of retrieved evidence, in the order it arrived. Sources are numbered from this.
+ * On a deep search each piece also says which sub-question found it.
+ */
+export type Evidence = ({ kind: 'web'; page: FetchedPage } | { kind: 'doc'; hit: DocHit }) & { subQuestion?: number };
 
 export interface AnswerResult {
   answerId: string;
@@ -189,7 +193,7 @@ If the user states a lasting fact or preference about themselves, call save_memo
 Search again only if the first results are off-topic. Stop calling tools as soon as the evidence covers the question, and reply with the single word DONE.
 Every tool call needs a one-sentence reason. Hard limit: ${maxCalls} tool calls in total.${known}`;
 
-const ANSWER_PROMPT = (o: {
+export const ANSWER_PROMPT = (o: {
   sourceCount: number;
   terminated: Terminated;
   known: string;
@@ -222,7 +226,7 @@ const ANSWER_PROMPT = (o: {
  * user, never evidence: an answer that cited "you told me you like TypeScript" as [3]
  * would be a citation to something that was not retrieved from the web or a document.
  */
-function knownAboutUser(memories: string[]): string {
+export function knownAboutUser(memories: string[]): string {
   if (!memories.length) return '';
   return (
     '\n\nSaved facts and preferences about this user (follow them; they are NOT sources, never cite them):\n' +
@@ -234,7 +238,7 @@ function knownAboutUser(memories: string[]): string {
 const PAGE_CHARS_FOR_ANSWER = 5_000;
 
 let client: OpenAI | null = null;
-function llm(): OpenAI {
+export function llm(): OpenAI {
   if (env.llmProvider !== 'openai') {
     throw new ProviderError('llm', `LLM_PROVIDER=${env.llmProvider} is not wired up; this agent speaks OpenAI`);
   }
@@ -249,9 +253,8 @@ function llm(): OpenAI {
  */
 export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): Promise<AnswerResult> {
   const { query, history } = ctx;
-  const started = run.started;
-  const deadline = started + env.maxWallClockSec * 1000;
-  const { toolCalls, tokens } = run;
+  const deadline = run.started + env.maxWallClockSec * 1000;
+  const { toolCalls } = run;
   const addUsage = (u?: { prompt_tokens?: number; completion_tokens?: number } | null) => run.addUsage(u);
 
   const evidence: Evidence[] = [];
@@ -263,38 +266,10 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
   const spaceLookup = ctx.spaceId ? spaceContents(ctx.spaceId, ctx.userId) : Promise.resolve(undefined);
 
   // ------------------------------------------------------------- recall: always, by the harness
-  const recallStarted = Date.now();
-  let recalled: string[];
-  try {
-    const r = await recallMemory(ctx.userId, query);
-    run.embeddingTokens += r.tokens;
-    recalled = r.memories.map((m) => m.text);
-  } catch (err) {
-    const error = errorMessage(err);
-    toolCalls.push({ name: 'recall_memory', ok: false, error, ms: Date.now() - recallStarted });
-    sse.send('trace', { step: 1, tool: 'recall_memory', input: { query }, ok: false, ms: Date.now() - recallStarted, error });
-    throw err;
-  }
-  const recallMs = Date.now() - recallStarted;
-  toolCalls.push({ name: 'recall_memory', ok: true, ms: recallMs });
-  sse.send('trace', {
-    step: 1,
-    tool: 'recall_memory',
-    input: { query },
-    ok: true,
-    ms: recallMs,
-    reason: recalled.length
-      ? `recalled ${recalled.length}: ${recalled.join(' | ').slice(0, 300)}`
-      : 'no saved memories for this user match'
-  });
-  const known = knownAboutUser(recalled);
+  const known = knownAboutUser(await recallStep(ctx, sse, run));
 
   // ------------------------------------------------------------- route: which tools, from mode
-  const space = await spaceLookup;
-  const route: Route = {
-    tools: ctx.mode === 'docs' ? 'docs' : ctx.mode === 'auto' && ctx.spaceId ? 'both' : 'web',
-    space
-  };
+  const route = routeFor(ctx, await spaceLookup);
   const tools = toolsFor(route.tools);
 
   // ------------------------------------------------------------- research: the loop
@@ -374,10 +349,78 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
   }
 
   // ------------------------------------------------------------- answer: sources, then tokens
-  // Numbered in the order retrieved, so a document search's best passage is its lowest [n].
-  const sources: Source[] = evidence.map((e, i): Source =>
-    e.kind === 'web'
-      ? { n: i + 1, kind: 'web', title: e.page.title, url: e.page.url, snippet: pickSnippet(e.page.text, query) }
+  return streamAnswer({
+    sse,
+    run,
+    query,
+    history,
+    evidence,
+    terminated,
+    depth: 'quick',
+    subQuestions: 0,
+    pageChars: PAGE_CHARS_FOR_ANSWER,
+    system: ANSWER_PROMPT({ sourceCount: evidence.length, terminated, known, saved, searched: retrieved })
+  });
+}
+
+// ---------------------------------------------------------------- shared by quick and deep
+
+/** recall_memory, run by the harness as step 1 of every answer. Returns the recalled facts. */
+export async function recallStep(ctx: AskContext, sse: Sse, run: RunState): Promise<string[]> {
+  const t0 = Date.now();
+  const input = { query: ctx.query };
+  try {
+    const r = await recallMemory(ctx.userId, ctx.query);
+    run.embeddingTokens += r.tokens;
+    const recalled = r.memories.map((m) => m.text);
+    const ms = Date.now() - t0;
+    run.toolCalls.push({ name: 'recall_memory', ok: true, ms });
+    sse.send('trace', {
+      step: run.toolCalls.length,
+      tool: 'recall_memory',
+      input,
+      ok: true,
+      ms,
+      reason: recalled.length
+        ? `recalled ${recalled.length}: ${recalled.join(' | ').slice(0, 300)}`
+        : 'no saved memories for this user match'
+    });
+    return recalled;
+  } catch (err) {
+    const error = errorMessage(err);
+    run.toolCalls.push({ name: 'recall_memory', ok: false, error, ms: Date.now() - t0 });
+    sse.send('trace', { step: run.toolCalls.length, tool: 'recall_memory', input, ok: false, ms: Date.now() - t0, error });
+    throw err;
+  }
+}
+
+export function routeFor(ctx: AskContext, space: SpaceContents | undefined): Route {
+  return { tools: ctx.mode === 'docs' ? 'docs' : ctx.mode === 'auto' && ctx.spaceId ? 'both' : 'web', space };
+}
+
+/**
+ * The end of every answer: number the evidence, send `sources`, THEN stream the answer as
+ * `token`s with unknown [n] dropped, then `done`.
+ */
+export async function streamAnswer(o: {
+  sse: Sse;
+  run: RunState;
+  query: string;
+  history: Turn[];
+  evidence: Evidence[];
+  terminated: Terminated;
+  depth: Depth;
+  subQuestions: number;
+  pageChars: number;
+  system: string;
+}): Promise<AnswerResult> {
+  const { sse, run, query, evidence, terminated } = o;
+
+  // Numbered in the order given, so a document search's best passage is its lowest [n].
+  const sources: Source[] = evidence.map((e, i): Source => {
+    const tag = e.subQuestion ? { subQuestion: e.subQuestion } : {};
+    return e.kind === 'web'
+      ? { n: i + 1, kind: 'web', title: e.page.title, url: e.page.url, snippet: pickSnippet(e.page.text, query), ...tag }
       : {
           n: i + 1,
           kind: 'doc',
@@ -385,15 +428,16 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
           docId: e.hit.docId as Source['docId'],
           locator: e.hit.locator,
           // The whole chunk: it IS the retrieved passage, verbatim, so it is what grounds the claim.
-          snippet: e.hit.text
-        }
-  );
+          snippet: e.hit.text,
+          ...tag
+        };
+  });
   sse.send('sources', sources);
 
   const context = evidence
     .map((e, i) =>
       e.kind === 'web'
-        ? `[${i + 1}] ${e.page.title}\n${e.page.url}\n${e.page.text.slice(0, PAGE_CHARS_FOR_ANSWER)}`
+        ? `[${i + 1}] ${e.page.title}\n${e.page.url}\n${e.page.text.slice(0, o.pageChars)}`
         : `[${i + 1}] ${e.hit.title}, ${locatorLabel(e.hit.locator)}\n${e.hit.text}`
     )
     .join('\n\n');
@@ -404,11 +448,8 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     stream_options: { include_usage: true },
     temperature: 0.2,
     messages: [
-      {
-        role: 'system',
-        content: ANSWER_PROMPT({ sourceCount: sources.length, terminated, known, saved, searched: retrieved })
-      },
-      ...history,
+      { role: 'system', content: o.system },
+      ...o.history,
       { role: 'user', content: `Question: ${query}\n\nSources:\n${context || '(none)'}` }
     ]
   });
@@ -417,19 +458,19 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
   let content = '';
   const emit = (text: string) => {
     if (!text) return;
-    ttftMs ??= Date.now() - started;
+    ttftMs ??= Date.now() - run.started;
     content += text;
     sse.send('token', { text });
   };
   const citations = new CitationFilter(sources.length);
   for await (const chunk of stream) {
-    if (chunk.usage) addUsage(chunk.usage);
+    if (chunk.usage) run.addUsage(chunk.usage);
     const delta = chunk.choices[0]?.delta?.content;
     if (delta) emit(citations.push(delta));
   }
   emit(citations.flush());
 
-  const latencyMs = Date.now() - started;
+  const latencyMs = Date.now() - run.started;
   const costUsd = run.costUsd();
   const answerId = newId('ans');
   // true only when EVERY search in the request was a hit. A request that made no search
@@ -441,12 +482,12 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     latencyMs,
     ttftMs: ttftMs ?? latencyMs,
     model: env.llmModel,
-    tokens,
+    tokens: run.tokens,
     costUsd,
     searchCached,
     terminated,
-    depth: 'quick',
-    subQuestions: 0
+    depth: o.depth,
+    subQuestions: o.subQuestions
   };
   sse.send('done', done);
 
@@ -454,8 +495,8 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     answerId,
     terminated,
     searchCached,
-    toolCalls,
-    tokens,
+    toolCalls: run.toolCalls,
+    tokens: run.tokens,
     costUsd,
     ttftMs: done.ttftMs,
     latencyMs,
@@ -490,7 +531,7 @@ function toolsFor(route: Route['tools']): ChatCompletionTool[] {
 }
 
 /** `p. 14`, `§ Pricing`, `line 40`: how a document citation says where it is. */
-function locatorLabel(l: DocHit['locator']): string {
+export function locatorLabel(l: DocHit['locator']): string {
   if (l.page !== undefined) return `p. ${l.page}`;
   if (l.heading !== undefined) return `§ ${l.heading}`;
   return `line ${l.line}`;
@@ -602,7 +643,7 @@ function safeArgs(call: ChatCompletionMessageToolCall): {
   }
 }
 
-function formatResults(results: SearchResult[]): string {
+export function formatResults(results: SearchResult[]): string {
   return results
     .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet.slice(0, 300)}`)
     .join('\n');
@@ -615,7 +656,7 @@ function formatResults(results: SearchResult[]): string {
  * page. So it is always a VERBATIM slice of the fetched text — never a model's paraphrase —
  * chosen as the paragraph that shares the most words with the question.
  */
-function pickSnippet(text: string, query: string): string {
+export function pickSnippet(text: string, query: string): string {
   const words = (s: string) => s.toLowerCase().match(/[\p{L}\p{N}]{4,}/gu) ?? [];
   const terms = new Set(words(query));
   const paragraphs = text.split('\n').filter((p) => p.split(' ').length >= 15);
@@ -677,7 +718,7 @@ class CitationFilter {
   }
 }
 
-function errorMessage(err: unknown): string {
+export function errorMessage(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   return msg.trim() || 'unknown error';
 }

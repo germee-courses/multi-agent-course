@@ -66,8 +66,14 @@ Status values: not started · in progress · completed · needs review
 - Kit quirk: gateway /health gives the agent 3 s; on slow network agent's DB ping exceeds it → flaps to "down". Left as is.
 - DESIGN.md open decision 1 now answered: in-process counters, spend routes only; with N gateways the effective limit is N × 30.
 
+- 2026-09-29: Step 8 (deep search) built, Plan-and-Execute: src/deep.ts — recall ‖ plan in parallel; plan_research = one json_schema LLM call (3–6 terse sub-questions + search query each), `plan` SSE before any retrieval; fan-out is CODE not LLM (per sub-q: search → top 3 unclaimed pages fetched in parallel; search_documents too in docs/auto+Space), budget split evenly so ≤ 24 steps; merge dedupes by URL / docId+locator in plan order, every step + source tagged subQuestion; structured answer (direct → ### per sub-q → Bottom line). Shared pieces pulled out of loop.ts (recallStep, routeFor, streamAnswer). src/quota.ts: DEEP_DAILY_CAP per user per UTC day, atomic conditional upsert (dup-key = over cap), counted at start; 429 {error, resetsAt next UTC midnight}. Deep answers save subQuestions; run log depth deep.
+- Verified: 3 bench deep questions — plan before retrieval ✓, 4–5 sub-qs, 15–20/20 steps tagged, all sources tagged, citations resolve, 17–22 steps, $0.012–0.046, 14–26 s. Deep/quick sources 12 vs 5 = 2.4× on Q1; cost question only 8 sources (ratio risk → DEEP_FETCHES_PER_SUB_QUESTION=4 if bench flags). Plan time 5.1 s → 2.0–3.2 s after making the planner terse (plan length = latency). Cap: 6 simultaneous reservations at cap 2 → exactly 2 ok; HTTP 429 + resetsAt before any spend; quick still allowed.
+- Learner learned: the plan streams first so the user can see/stop it, it's the first paint, and a plan after retrieval is a rationalisation.
+- DESIGN.md open decision 2 answered: the day resets at UTC midnight; a deep search counts when it starts.
+
 ## Next step
-- Run the official `npm run bench` (through :8787) on a stable network: web workload, routerPicksDocs, pageLocator, 202 p95 < 300 ms, decoupling. Deep search rows will fail until step 8.
+- /stats (answers, costUsdToday, cache hit rate, TTFT p95, deepToday, deepDailyCap — must reconcile with the run logs).
+- Then run the official `npm run bench` (through :8787) on a stable network.
 - DESIGN.md (learner's voice): (1) recall_memory run by harness every answer; (2) why no re-rank step (small Space, RRF baseline, TTFT already over budget; revisit if recall@5 < 0.70).
 - Then step 8: deep search (plan_research + plan event before retrieval).
 - Optional later: Module 1 quiz; reconciliation agent build.

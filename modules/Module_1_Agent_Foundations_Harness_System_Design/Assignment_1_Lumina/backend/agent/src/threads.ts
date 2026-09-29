@@ -7,6 +7,7 @@ import {
   type ListThreadsResponse,
   type MessageDoc,
   type Source,
+  type SubQuestion,
   type ThreadDoc
 } from '@lumina/contract';
 import { db } from './db.js';
@@ -101,7 +102,7 @@ export async function saveUserMessage(thread: ThreadDoc, content: string): Promi
 
 export async function saveAnswer(
   thread: ThreadDoc,
-  answer: { content: string; sources: Source[]; done: DoneEvent }
+  answer: { content: string; sources: Source[]; done: DoneEvent; subQuestions?: SubQuestion[] }
 ): Promise<void> {
   await (await messages()).insertOne({
     _id: `msg_${randomUUID()}`,
@@ -112,6 +113,8 @@ export async function saveAnswer(
     answerId: answer.done.answerId,
     sources: answer.sources,
     done: answer.done,
+    // A deep answer keeps its plan, so it stays explainable after the stream is gone.
+    ...(answer.subQuestions?.length ? { subQuestions: answer.subQuestions } : {}),
     createdAt: new Date()
   });
 }

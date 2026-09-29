@@ -51,12 +51,15 @@ import {
   ROUTES,
   USER_HEADER,
   newId,
+  type SubQuestion,
   type Terminated
 } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
 import { Sse } from './sse.js';
-import { runQuickAnswer } from './loop.js';
+import { runQuickAnswer, type AnswerResult } from './loop.js';
+import { runDeepAnswer } from './deep.js';
+import { reserveDeepSearch } from './quota.js';
 import {
   createThread,
   findThread,
@@ -150,8 +153,6 @@ app.post('/threads/:threadId/ask', async (req, res) => {
   if (!body.success) return fail(res, 400, zodMessage(body.error));
 
   const { query, depth, mode, spaceId } = body.data;
-  // Not built yet. An honest 501 beats quietly running a quick web search instead.
-  if (depth === 'deep') return fail(res, 501, 'not implemented yet: deep search');
   if (mode === 'docs' && !spaceId) return fail(res, 400, 'spaceId: required when mode is docs');
 
   const sse = new Sse(res);
@@ -166,21 +167,41 @@ app.post('/threads/:threadId/ask', async (req, res) => {
     // Another user's Space is "not found", exactly like their thread.
     if (spaceId && !(await findSpace(spaceId, userId))) return fail(res, 404, `unknown space ${spaceId}`);
 
+    // The spend gate, checked after the cheap 4xx checks and before a cent is spent.
+    if (depth === 'deep') {
+      const quota = await reserveDeepSearch(userId);
+      if (!quota.ok) {
+        return res.status(429).json({
+          error: `deep search daily cap reached (${env.deepDailyCap} per day)`,
+          status: 429,
+          resetsAt: quota.resetsAt.toISOString()
+        });
+      }
+    }
+
     // History first (so it does not include this question), then record the question.
     const history = await loadHistory(thread._id, userId);
     await saveUserMessage(thread, query);
 
     run = new RunState();
-    const r = await runQuickAnswer({ query, history, userId, threadId: thread._id, mode, spaceId }, sse, run);
+    const ctx = { query, history, userId, threadId: thread._id, mode, spaceId };
+    const r: AnswerResult & { subQuestions?: SubQuestion[] } =
+      depth === 'deep' ? await runDeepAnswer(ctx, sse, run) : await runQuickAnswer(ctx, sse, run);
     terminated = r.terminated;
     answerId = r.answerId;
     // The answer is saved only once it finished (done or an honest cap). A run that threw
     // saves nothing: a half-streamed answer must not come back as if it were complete.
-    await saveAnswer(thread, { content: r.content, sources: r.sources, done: r.done });
+    await saveAnswer(thread, {
+      content: r.content,
+      sources: r.sources,
+      done: r.done,
+      subQuestions: r.subQuestions
+    });
     log.info(
       {
         requestId,
         userId,
+        depth,
         toolCalls: r.toolCalls.length,
         terminated: r.terminated,
         tokens: r.tokens,
@@ -202,7 +223,7 @@ app.post('/threads/:threadId/ask', async (req, res) => {
     sse.end();
     // After the stream has closed, so writing the log never delays the user.
     if (run) {
-      await writeRunLog(run, { requestId, userId, threadId: req.params.threadId, query, terminated, depth: 'quick', answerId });
+      await writeRunLog(run, { requestId, userId, threadId: req.params.threadId, query, terminated, depth, answerId });
     }
   }
 });

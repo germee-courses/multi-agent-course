@@ -37,6 +37,10 @@ export const env = {
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
   deepSubQuestionsMax: num(process.env.DEEP_SUB_QUESTIONS_MAX, 6),
   deepDailyCap: num(process.env.DEEP_DAILY_CAP, 5),
+  /** Pages read per sub-question. Deep has to read ≥ 2× quick's sources; quick reads 2–4. */
+  deepFetchesPerSubQuestion: num(process.env.DEEP_FETCHES_PER_SUB_QUESTION, 3),
+  /** Deep reads more pages, so it reads less of each: the answer's context stays affordable. */
+  deepPageChars: num(process.env.DEEP_PAGE_CHARS, 3500),
 
   // The hard caps from AGENTS.md. Raising these to make a gate pass is the failure mode
   // the caps exist to catch. Two gears, two envelopes.
