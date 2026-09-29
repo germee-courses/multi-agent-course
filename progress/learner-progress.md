@@ -58,8 +58,16 @@ Status values: not started · in progress · completed · needs review
 - Verified: docs k1 → [1] retrieval-basics.pdf p.1, "1.2 [1]"; auto churn → model chose docs ("likely documented in our own materials"), cites note.md § Churn plan; off-topic → searched twice, no sources, "could not find". Latency 17–71 s = network (OpenAI unreachable within 10 s at the time), not code.
 - Learner learned: BM25 catches exact rare tokens (k1); vectors catch synonyms (car/automobile); RRF fuses ranks because scores aren't comparable.
 
+- 2026-09-29: recall@5 measured with a scratch script using bench.mjs's exact hit rule (agent :8001, mode docs, fresh Space with the 4 gold files): **29/30 = 0.97** (bench subset), 38/39 overall. No re-rank needed. The one miss (g27, "terminated" values) is the model's rewritten query ("terminated field values") losing context — the raw question ranks the right chunk #1. Left as is (don't overfit one gold item); revisit if real questions show it (Module 3: query transformation).
+- Gap found: the gateway (backend/gateway) is still all 501; the official bench targets it (:8787). Needs its own step.
+
+- 2026-09-29: Gateway built (backend/gateway/src/index.ts): per contract route → 401 no X-User-Id → 429 {error, resetsAt} + Retry-After (sliding window, in-process, SPENDING routes only: ask + upload, because the UI polls docs every 1.5 s) → zod 400 → proxy (JSON validated body; upload streams raw multipart; ask pipes SSE frame by frame; browser disconnect aborts upstream; 60 s timeout on non-streaming) → 502 when agent unreachable, SSE error event if stream breaks. Serves reports/report.json at /evals/report.json (404 until the eval skill writes it).
+- Verified through :8787: 401, 400, 404 (other user's space), 202 upload, 429 on 4th of 3/min, 502 agent down, X-Request-Id reused/echoed and found in agent answer log, SSE not buffered (trace@4s … token@16s … done@17s).
+- Kit quirk: gateway /health gives the agent 3 s; on slow network agent's DB ping exceeds it → flaps to "down". Left as is.
+- DESIGN.md open decision 1 now answered: in-process counters, spend routes only; with N gateways the effective limit is N × 30.
+
 ## Next step
-- Run `npm run bench` on a stable network: recall@5 ≥ 0.70 over 39 gold questions, routerPicksDocs, pageLocator, 202 p95 < 300 ms.
+- Run the official `npm run bench` (through :8787) on a stable network: web workload, routerPicksDocs, pageLocator, 202 p95 < 300 ms, decoupling. Deep search rows will fail until step 8.
 - DESIGN.md (learner's voice): (1) recall_memory run by harness every answer; (2) why no re-rank step (small Space, RRF baseline, TTFT already over budget; revisit if recall@5 < 0.70).
 - Then step 8: deep search (plan_research + plan event before retrieval).
 - Optional later: Module 1 quiz; reconciliation agent build.

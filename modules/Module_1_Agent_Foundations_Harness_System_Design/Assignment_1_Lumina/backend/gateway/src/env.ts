@@ -18,6 +18,10 @@ export const env = {
     .map((s) => s.trim())
     .filter(Boolean),
   rateLimitPerMinute: num(process.env.RATE_LIMIT_PER_MINUTE, 30),
+  /** Non-streaming calls to the agent give up after this; an ask streams for as long as it runs. */
+  upstreamTimeoutMs: num(process.env.UPSTREAM_TIMEOUT_MS, 60_000),
+  /** Written by the fde-lumina-eval skill (eval/build-report.mjs --out reports/report.json). */
+  reportFile: resolve(process.cwd(), '../../reports/report.json'),
   logLevel: process.env.LOG_LEVEL ?? 'info',
   /** Serve the built UI from the gateway in production so one host serves / and /evals. */
   webDist: resolve(process.cwd(), '../../web/dist')
