@@ -44,8 +44,12 @@ export const env = {
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
   deepSubQuestionsMax: num(process.env.DEEP_SUB_QUESTIONS_MAX, 6),
   deepDailyCap: num(process.env.DEEP_DAILY_CAP, 5),
-  /** Pages read per sub-question. Deep has to read ≥ 2× quick's sources; quick reads 2–4. */
-  deepFetchesPerSubQuestion: num(process.env.DEEP_FETCHES_PER_SUB_QUESTION, 3),
+  /**
+   * Most pages read per sub-question. Deep has to read ≥ 2× quick's sources, and quick reads
+   * 2–4. 3 fell to 1.75× on a 4-sub-question plan (some pages refuse to load), so 4; the
+   * 24-step budget still trims this automatically for 5–6 sub-questions.
+   */
+  deepFetchesPerSubQuestion: num(process.env.DEEP_FETCHES_PER_SUB_QUESTION, 4),
   /** Deep reads more pages, so it reads less of each: the answer's context stays affordable. */
   deepPageChars: num(process.env.DEEP_PAGE_CHARS, 3500),
 

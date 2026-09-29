@@ -72,8 +72,13 @@ export function acceptedType(file: Pick<UploadedFile, 'originalname' | 'mimetype
 }
 
 /**
- * Store the file, then the `pending` document, then its job. Returns as soon as all three
- * are committed; nothing here reads the file's contents.
+ * Store the file and the `pending` document side by side, then its job. Returns as soon as
+ * all three are committed; nothing here reads the file's contents.
+ *
+ * The 202 has a 300 ms budget and every write is a round trip to Atlas, so the two that do
+ * not depend on each other run in parallel: GridFS assigns the file's id when the stream
+ * OPENS, so the document can name it before a byte is written. The job goes last, because
+ * the worker that claims it needs both the file and the document to exist.
  */
 export async function uploadDocument(space: SpaceDoc, file: UploadedFile, mimeType: string): Promise<string> {
   const database = await db();
@@ -83,24 +88,37 @@ export async function uploadDocument(space: SpaceDoc, file: UploadedFile, mimeTy
   const stream = bucket.openUploadStream(file.originalname, {
     metadata: { docId, spaceId: space._id, userId: space.userId, mimeType }
   });
-  await new Promise<void>((resolve, reject) => {
+  const writeFile = new Promise<void>((resolve, reject) => {
     stream.once('finish', () => resolve());
     stream.once('error', reject);
     stream.end(file.buffer);
   });
+  const insertDocument = (async () =>
+    (await documents()).insertOne({
+      _id: docId,
+      spaceId: space._id,
+      userId: space.userId,
+      title: file.originalname,
+      mimeType,
+      bytes: file.size,
+      status: 'pending',
+      pct: 0,
+      fileId: stream.id.toString(),
+      createdAt: new Date()
+    }))();
 
-  await (await documents()).insertOne({
-    _id: docId,
-    spaceId: space._id,
-    userId: space.userId,
-    title: file.originalname,
-    mimeType,
-    bytes: file.size,
-    status: 'pending',
-    pct: 0,
-    fileId: stream.id.toString(),
-    createdAt: new Date()
-  });
+  const [fileWrite, docWrite] = await Promise.allSettled([writeFile, insertDocument]);
+  if (fileWrite.status === 'rejected' || docWrite.status === 'rejected') {
+    const err = fileWrite.status === 'rejected' ? fileWrite.reason : (docWrite as PromiseRejectedResult).reason;
+    // If the row made it but the file did not, the row must not sit at `pending` forever.
+    if (docWrite.status === 'fulfilled') {
+      await (await documents()).updateOne(
+        { _id: docId },
+        { $set: { status: 'failed', error: `upload failed: ${(err as Error).message}` } }
+      );
+    }
+    throw err;
+  }
 
   try {
     await (await jobs()).insertOne({

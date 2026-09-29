@@ -78,8 +78,11 @@ Status values: not started · in progress · completed · needs review
 - Diagnosis: deepCap429 = one deep answer hung 941 s — OpenAI SDK default timeout 10 min + 2 retries. Cache 35% = 6/20 repeats missed because the model reworded its search query; 50% needs EVERY repeat to hit. TTFT ≈ 12.7 s avg: tools ~3.5 s, the rest ≈ 4 sequential LLM turns at ~2 s each on this network.
 - Fixes: (1) OpenAI timeouts (LLM 60 s, embeddings 20 s, maxRetries 1) + 30 s idle watchdog on the answer stream → ProviderError → 502. (2) Learner chose "first search by LUMINA": on a fresh thread in web mode (or auto with no Space) the harness searches the question as asked, in parallel with recall — one fewer LLM turn, repeats hit the cache; model still picks pages / may search again. Statement-only messages still just confirm the memory. Verified: repeat searchCached true, TTFT 15.3 s → 6.3 s on repeat.
 
+- 2026-09-30: SECOND BENCH (cache still warm from run 1 → cache 75% is inflated): deepCap429 ✓ now (6th deep → 429 + resetsAt). New misses: 202 p95 332 ms (only 4 uploads, so p95 = slowest; network) and deep/quick 1.75× on the cost question (4 sub-qs, some 403s). TTFT 24.4 s / answer 27.9 s — network was worse (idle search p95 28 s).
+- Fixes: DEEP_FETCHES_PER_SUB_QUESTION 3 → 4 (24-step budget still trims it for 5–6 sub-qs); upload writes GridFS file ‖ document row in parallel (GridFS id exists when the stream opens), job last → warm uploads 157–240 ms.
+
 ## Next step
-- Re-run `npm run bench` to measure the fixes. TTFT 2.5 s is still out of reach on this network — record honestly in DESIGN.md; deploying next to Atlas/OpenAI will help.
+- Re-run `npm run bench` AFTER the 6 h search-cache window from run 2 for an honest cache number. TTFT 2.5 s is still out of reach on this network — record honestly in DESIGN.md; deploying next to Atlas/OpenAI will help.
 - DESIGN.md in learner's voice: memory recall every answer; no re-rank (recall@5 0.97); rate limit on spend routes, in-process; deep cap UTC midnight, counted at start; /stats from the logs.
 - Deploy (Fly.io both services) → /fde-lumina-eval → demo video.
 - DESIGN.md (learner's voice): (1) recall_memory run by harness every answer; (2) why no re-rank step (small Space, RRF baseline, TTFT already over budget; revisit if recall@5 < 0.70).
