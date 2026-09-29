@@ -71,9 +71,13 @@ Status values: not started · in progress · completed · needs review
 - Learner learned: the plan streams first so the user can see/stop it, it's the first paint, and a plan after retrieval is a rationalisation.
 - DESIGN.md open decision 2 answered: the day resets at UTC midnight; a deep search counts when it starts.
 
+- 2026-09-30: /stats built (src/stats.ts): today = UTC day; service-wide except deepToday (per user). requests = new `requests` collection, one row per agent request (recordRequests middleware, not /health, fire-and-forget); answers (done|cap), costUsdToday (all runs), cache hit % and TTFT p95 aggregated from today's `runs` rows, which now also carry searches/cacheHits/ttftMs (file shape for check.mjs unchanged). Verified: 401 without user; +2 answers after 2 asks; /stats 56 answers / $0.348 = independent sum of today's runs/*.json files exactly. Gateway-rejected calls (401/400/429 at the edge) aren't counted — note for DESIGN.md.
+- ALL BUILD STEPS DONE.
+
 ## Next step
-- /stats (answers, costUsdToday, cache hit rate, TTFT p95, deepToday, deepDailyCap — must reconcile with the run logs).
-- Then run the official `npm run bench` (through :8787) on a stable network.
+- Run the official `npm run bench` (through :8787) on a stable network; fix what it flags (watch deep/quick source ratio on the cost question).
+- DESIGN.md in learner's voice: memory recall every answer; no re-rank (recall@5 0.97); rate limit on spend routes, in-process; deep cap UTC midnight, counted at start; /stats from the logs.
+- Deploy (Fly.io both services) → /fde-lumina-eval → demo video.
 - DESIGN.md (learner's voice): (1) recall_memory run by harness every answer; (2) why no re-rank step (small Space, RRF baseline, TTFT already over budget; revisit if recall@5 < 0.70).
 - Then step 8: deep search (plan_research + plan event before retrieval).
 - Optional later: Module 1 quiz; reconciliation agent build.

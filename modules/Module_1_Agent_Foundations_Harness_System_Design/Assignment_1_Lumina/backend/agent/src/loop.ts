@@ -459,6 +459,7 @@ export async function streamAnswer(o: {
   const emit = (text: string) => {
     if (!text) return;
     ttftMs ??= Date.now() - run.started;
+    run.ttftMs = ttftMs;
     content += text;
     sse.send('token', { text });
   };

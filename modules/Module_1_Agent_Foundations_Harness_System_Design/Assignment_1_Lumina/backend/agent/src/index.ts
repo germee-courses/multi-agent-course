@@ -60,6 +60,7 @@ import { Sse } from './sse.js';
 import { runQuickAnswer, type AnswerResult } from './loop.js';
 import { runDeepAnswer } from './deep.js';
 import { reserveDeepSearch } from './quota.js';
+import { recordRequests, stats } from './stats.js';
 import {
   createThread,
   findThread,
@@ -82,6 +83,8 @@ app.use((req, res, next) =>
     ? next()
     : express.json({ limit: '1mb' })(req, res, next)
 );
+
+app.use(recordRequests);
 
 mkdirSync(env.runsDir, { recursive: true });
 
@@ -311,6 +314,18 @@ app.get('/spaces/:spaceId/documents', async (req, res, next) => {
     if (!userId) return fail(res, 401, 'X-User-Id header is required');
     if (!(await findSpace(req.params.spaceId, userId))) return fail(res, 404, `unknown space ${req.params.spaceId}`);
     res.json(await listDocuments(req.params.spaceId, userId));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------- /stats
+
+app.get('/stats', async (req, res, next) => {
+  try {
+    const userId = req.header(USER_HEADER);
+    if (!userId) return fail(res, 401, 'X-User-Id header is required');
+    res.json(await stats(userId));
   } catch (err) {
     next(err);
   }

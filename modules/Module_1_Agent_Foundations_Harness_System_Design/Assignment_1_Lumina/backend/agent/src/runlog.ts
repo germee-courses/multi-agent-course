@@ -31,6 +31,8 @@ export class RunState {
   /** Every web_search the run made, and how many of those the cache answered. */
   searches = 0;
   cacheHits = 0;
+  /** Set when the first token streams; stays null for a run that never answered. */
+  ttftMs: number | null = null;
 
   addUsage(u?: { prompt_tokens?: number; completion_tokens?: number } | null): void {
     this.tokens.in += u?.prompt_tokens ?? 0;
@@ -46,6 +48,13 @@ export class RunState {
       (this.searches - this.cacheHits) * env.searchUsdPerCall;
     return Math.round(usd * 1e6) / 1e6;
   }
+}
+
+/** Extra fields on a `runs` row that /stats reads. */
+export interface StatsFields {
+  searches: number;
+  cacheHits: number;
+  ttftMs: number | null;
 }
 
 export interface RunMeta {
@@ -81,16 +90,21 @@ export async function writeRunLog(run: RunState, meta: RunMeta): Promise<void> {
   }
 
   try {
-    const doc: RunDoc = {
+    // The file stays exactly the RunLog shape check.mjs reads. The collection row also
+    // carries what /stats adds up, so /stats is computed from the log, not kept beside it.
+    const doc: RunDoc & StatsFields = {
       ...entry,
       requestId: meta.requestId,
       userId: meta.userId,
       threadId: meta.threadId as RunDoc['threadId'],
       answerId: meta.answerId as RunDoc['answerId'],
       query: meta.query,
+      searches: run.searches,
+      cacheHits: run.cacheHits,
+      ttftMs: run.ttftMs,
       createdAt: new Date()
     };
-    await (await db()).collection<RunDoc>(COLLECTIONS.runs).insertOne(doc);
+    await (await db()).collection<RunDoc & StatsFields>(COLLECTIONS.runs).insertOne(doc);
   } catch (err) {
     log.error({ err, requestId: meta.requestId }, 'run log: runs collection write failed');
   }
