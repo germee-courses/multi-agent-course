@@ -208,7 +208,9 @@ export const ANSWER_PROMPT = (o: {
     o.saved.length
       ? `You just saved this to the user's long-term memory: ${o.saved.map((s) => `"${s}"`).join('; ')}. Confirm that briefly.`
       : '',
-    o.sourceCount === 0 && o.saved.length && !o.searched
+    // Saved a memory and read nothing: that was a statement, not a question (the harness's
+    // first search may still have run, so "searched" does not decide this).
+    o.sourceCount === 0 && o.saved.length
       ? 'The user only told you something about themselves; there was nothing to research. Do not cite anything.'
       : o.sourceCount === 0
         ? 'NO sources were retrieved for this question. Say that you could not find sources to answer it. Do not cite anything and do not answer from memory.'
@@ -243,7 +245,7 @@ export function llm(): OpenAI {
     throw new ProviderError('llm', `LLM_PROVIDER=${env.llmProvider} is not wired up; this agent speaks OpenAI`);
   }
   if (!secrets.openai) throw new ProviderError('openai', 'OPENAI_API_KEY is not set');
-  client ??= new OpenAI({ apiKey: secrets.openai });
+  client ??= new OpenAI({ apiKey: secrets.openai, timeout: env.llmTimeoutMs, maxRetries: 1 });
   return client;
 }
 
@@ -265,6 +267,19 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
   // The Space's file list is what `auto` routes on; fetch it while memory is recalled.
   const spaceLookup = ctx.spaceId ? spaceContents(ctx.spaceId, ctx.userId) : Promise.resolve(undefined);
 
+  /**
+   * First search by the harness. On a fresh thread in web mode the first move is always a
+   * search for the question, so the harness makes it — with the question AS ASKED — instead
+   * of paying a model turn to decide it. Two wins: one fewer LLM round trip before the first
+   * token, and the same question always makes the same query, so a repeat hits the cache.
+   * Follow-ups (history) and document routes still let the model write the query: "how much
+   * does it cost?" needs the conversation to become a search. The model still chooses the
+   * pages and whether to search again.
+   */
+  // `auto` with no Space can only go to the web, so it counts as web here.
+  const harnessSearch = history.length === 0 && (ctx.mode === 'web' || (ctx.mode === 'auto' && !ctx.spaceId));
+  const firstSearch = harnessSearch ? timed(() => cachedSearch(query)) : null;
+
   // ------------------------------------------------------------- recall: always, by the harness
   const known = knownAboutUser(await recallStep(ctx, sse, run));
 
@@ -278,6 +293,39 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     ...history,
     { role: 'user', content: query }
   ];
+
+  if (firstSearch) {
+    const input = { query };
+    const reason = 'LUMINA searches the question as asked (first step of a new thread)';
+    const r = await firstSearch;
+    if (!r.ok) {
+      const error = errorMessage(r.error);
+      toolCalls.push({ name: 'web_search', ok: false, error, ms: r.ms });
+      sse.send('trace', { step: toolCalls.length, tool: 'web_search', input, ok: false, ms: r.ms, error });
+      throw r.error;
+    }
+    const { results, cached } = r.value;
+    toolCalls.push({ name: 'web_search', ok: true, ms: r.ms });
+    sse.send('trace', { step: toolCalls.length, tool: 'web_search', input, ok: true, ms: r.ms, reason });
+    run.searches += 1;
+    if (cached) run.cacheHits += 1;
+    retrieved = true;
+    // Shown to the model as its own first call, so the conversation it continues is coherent.
+    messages.push(
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'call_first_search', type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query, reason }) } }
+        ]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_first_search',
+        content: results.length ? formatResults(results) : '0 results. Try one different query, or stop and reply DONE.'
+      }
+    );
+  }
 
   for (let turn = 1; ; turn++) {
     if (Date.now() >= deadline) {
@@ -464,10 +512,23 @@ export async function streamAnswer(o: {
     sse.send('token', { text });
   };
   const citations = new CitationFilter(sources.length);
-  for await (const chunk of stream) {
-    if (chunk.usage) run.addUsage(chunk.usage);
-    const delta = chunk.choices[0]?.delta?.content;
-    if (delta) emit(citations.push(delta));
+  // The client timeout covers the wait for the stream to START; this covers it going quiet
+  // halfway. Aborting makes the loop below throw, and the route turns that into a 502.
+  let stalled = false;
+  let idle = setTimeout(() => ((stalled = true), stream.controller.abort()), env.llmStreamIdleMs);
+  try {
+    for await (const chunk of stream) {
+      clearTimeout(idle);
+      idle = setTimeout(() => ((stalled = true), stream.controller.abort()), env.llmStreamIdleMs);
+      if (chunk.usage) run.addUsage(chunk.usage);
+      const delta = chunk.choices[0]?.delta?.content;
+      if (delta) emit(citations.push(delta));
+    }
+  } catch (err) {
+    if (stalled) throw new ProviderError('llm', `answer stream sent nothing for ${env.llmStreamIdleMs / 1000}s`);
+    throw err;
+  } finally {
+    clearTimeout(idle);
   }
   emit(citations.flush());
 
@@ -716,6 +777,16 @@ class CitationFilter {
     if (!m) return tag;
     const n = Number(m[1]);
     return n >= 1 && n <= this.sourceCount ? tag : '';
+  }
+}
+
+/** Runs `fn` now and settles to its value or error plus how long it took, without throwing. */
+async function timed<T>(fn: () => Promise<T>): Promise<{ ok: true; value: T; ms: number } | { ok: false; error: unknown; ms: number }> {
+  const t0 = Date.now();
+  try {
+    return { ok: true, value: await fn(), ms: Date.now() - t0 };
+  } catch (error) {
+    return { ok: false, error, ms: Date.now() - t0 };
   }
 }
 

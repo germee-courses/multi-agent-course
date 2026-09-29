@@ -30,7 +30,7 @@ const RECALL_LIMIT = 5;
 let client: OpenAI | null = null;
 function openai(): OpenAI {
   if (!secrets.openai) throw new ProviderError('openai', 'OPENAI_API_KEY is not set');
-  client ??= new OpenAI({ apiKey: secrets.openai });
+  client ??= new OpenAI({ apiKey: secrets.openai, timeout: env.embeddingTimeoutMs, maxRetries: 1 });
   return client;
 }
 

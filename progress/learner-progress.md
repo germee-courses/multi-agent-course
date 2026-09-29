@@ -74,8 +74,12 @@ Status values: not started · in progress · completed · needs review
 - 2026-09-30: /stats built (src/stats.ts): today = UTC day; service-wide except deepToday (per user). requests = new `requests` collection, one row per agent request (recordRequests middleware, not /health, fire-and-forget); answers (done|cap), costUsdToday (all runs), cache hit % and TTFT p95 aggregated from today's `runs` rows, which now also carry searches/cacheHits/ttftMs (file shape for check.mjs unchanged). Verified: 401 without user; +2 answers after 2 asks; /stats 56 answers / $0.348 = independent sum of today's runs/*.json files exactly. Gateway-rejected calls (401/400/429 at the edge) aren't counted — note for DESIGN.md.
 - ALL BUILD STEPS DONE.
 
+- 2026-09-30: FIRST OFFICIAL BENCH (learner ran it): 13/16 SLA + 20/22 caps. Pass: contract, 202 p95 265 ms, ingest decoupling 0.94×, recall@5 0.967, grounding 0.994, error rate 0, all deep checks (plan p95 2.4 s, ratio ≥ 2.5×, $0.031/deep), memory, stats reconcile, page locator, router picks docs. FAIL: ttft p95 22.6 s (≤ 2.5), answer p95 23.8 s (≤ 12), cache hit 35% (≥ 50%), deepCap429 (probe timed out).
+- Diagnosis: deepCap429 = one deep answer hung 941 s — OpenAI SDK default timeout 10 min + 2 retries. Cache 35% = 6/20 repeats missed because the model reworded its search query; 50% needs EVERY repeat to hit. TTFT ≈ 12.7 s avg: tools ~3.5 s, the rest ≈ 4 sequential LLM turns at ~2 s each on this network.
+- Fixes: (1) OpenAI timeouts (LLM 60 s, embeddings 20 s, maxRetries 1) + 30 s idle watchdog on the answer stream → ProviderError → 502. (2) Learner chose "first search by LUMINA": on a fresh thread in web mode (or auto with no Space) the harness searches the question as asked, in parallel with recall — one fewer LLM turn, repeats hit the cache; model still picks pages / may search again. Statement-only messages still just confirm the memory. Verified: repeat searchCached true, TTFT 15.3 s → 6.3 s on repeat.
+
 ## Next step
-- Run the official `npm run bench` (through :8787) on a stable network; fix what it flags (watch deep/quick source ratio on the cost question).
+- Re-run `npm run bench` to measure the fixes. TTFT 2.5 s is still out of reach on this network — record honestly in DESIGN.md; deploying next to Atlas/OpenAI will help.
 - DESIGN.md in learner's voice: memory recall every answer; no re-rank (recall@5 0.97); rate limit on spend routes, in-process; deep cap UTC midnight, counted at start; /stats from the logs.
 - Deploy (Fly.io both services) → /fde-lumina-eval → demo video.
 - DESIGN.md (learner's voice): (1) recall_memory run by harness every answer; (2) why no re-rank step (small Space, RRF baseline, TTFT already over budget; revisit if recall@5 < 0.70).

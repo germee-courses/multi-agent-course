@@ -25,6 +25,13 @@ export const env = {
 
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
 
+  // The OpenAI SDK's defaults are a 10-minute timeout and 2 retries: one stalled connection
+  // once held a deep search for 941 s against a 240 s cap. Every model call is bounded here.
+  llmTimeoutMs: num(process.env.LLM_TIMEOUT_MS, 60_000),
+  embeddingTimeoutMs: num(process.env.EMBEDDING_TIMEOUT_MS, 20_000),
+  /** An answer stream that sends nothing for this long is dead: abort it and fail loud. */
+  llmStreamIdleMs: num(process.env.LLM_STREAM_IDLE_MS, 30_000),
+
   // What an answer costs, so `done.costUsd` is measured rather than guessed. The defaults
   // are gpt-4.1-mini's published rates at the time of writing — check your provider's
   // pricing page and override in .env if they have changed or you switch model.
