@@ -1,0 +1,22 @@
+# The UI: static files only, its own public Railway service. It holds no key: the one
+# variable baked in is VITE_API_URL, the gateway's public URL, passed as a build arg.
+FROM node:20-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/contract/package.json packages/contract/
+COPY backend/agent/package.json backend/agent/
+COPY backend/gateway/package.json backend/gateway/
+COPY web/package.json web/
+RUN npm ci
+COPY packages/contract packages/contract
+COPY web web
+ARG VITE_API_URL
+ENV VITE_API_URL=$VITE_API_URL
+RUN npm run build -w @lumina/contract && npm run build -w @lumina/web
+
+FROM nginx:1.27-alpine
+# The nginx image renders templates with envsubst at start, so the server listens on Railway's $PORT.
+COPY web/nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=build /app/web/dist /usr/share/nginx/html
+ENV PORT=8080
+EXPOSE 8080

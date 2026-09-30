@@ -5,6 +5,8 @@ web/dist/
 .env.*
 !.env.example
 runs/
-reports/
+reports/*
+!reports/.gitkeep
+!reports/report.json
 *.log
 .DS_Store

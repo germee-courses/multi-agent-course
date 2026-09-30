@@ -1,0 +1,23 @@
+# The gateway: the only public service. It holds no provider key.
+# Built from the assignment root, because it depends on the workspace's contract package.
+FROM node:20-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/contract/package.json packages/contract/
+COPY backend/agent/package.json backend/agent/
+COPY backend/gateway/package.json backend/gateway/
+COPY web/package.json web/
+RUN npm ci
+COPY packages/contract packages/contract
+COPY backend/gateway backend/gateway
+RUN npm run build -w @lumina/contract && npm run build -w @lumina/gateway
+
+FROM node:20-slim
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build /app /app
+# The eval report the UI renders at /evals. Redeploy after the eval skill rewrites it.
+COPY reports/ /app/reports/
+WORKDIR /app/backend/gateway
+EXPOSE 8080
+CMD ["node", "dist/index.js"]

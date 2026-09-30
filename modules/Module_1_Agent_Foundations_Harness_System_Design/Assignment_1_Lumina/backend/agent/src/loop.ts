@@ -28,8 +28,10 @@ import type { RunState, ToolCallRecord } from './runlog.js';
  *
  *   recall    the harness runs recall_memory first, every time: "what do I already know
  *             about this user" must always happen, so it is not left to the model.
- *   research  think → call a tool → observe → repeat, until the model stops asking for
- *             tools (done) or a cap is hit (cap). Every tool call is a `trace` event.
+ *   research  at most two model turns inside a fixed plan (see ResearchPlan): the model
+ *             picks the queries and the pages, the plan decides how many. It ends when
+ *             the plan has nothing left to offer (done), or at a hard cap (cap). Every
+ *             tool call is a `trace` event.
  *   answer    number what was actually fetched, send `sources`, THEN stream the answer
  *             as `token`s, then `done`.
  *
@@ -186,12 +188,12 @@ function spaceList(space: SpaceContents): string {
   return ready + waiting;
 }
 
-const RESEARCH_PROMPT = (maxCalls: number, known: string, route: Route) => `You are the research step of LUMINA, an answer engine. Gather evidence; do not answer.
+const RESEARCH_PROMPT = (known: string, route: Route) => `You are the research step of LUMINA, an answer engine. Gather evidence; do not answer.
 ${routeInstructions(route)}
 Earlier turns of the conversation may come first: resolve words like "it" or "that" from them and search for the full topic, not the literal follow-up words.
 If the user states a lasting fact or preference about themselves, call save_memory once for it. If the message only tells you something about the user and asks nothing, save it and reply DONE without searching.
-Search again only if the first results are off-topic. Stop calling tools as soon as the evidence covers the question, and reply with the single word DONE.
-Every tool call needs a one-sentence reason. Hard limit: ${maxCalls} tool calls in total.${known}`;
+Research is at most two turns, so make every call you need in THIS turn, in parallel (for example, fetch all 2-4 pages at once). Only the tools that still make sense are offered.
+If none of them is needed, reply with the single word DONE. Every tool call needs a one-sentence reason.${known}`;
 
 export const ANSWER_PROMPT = (o: {
   sourceCount: number;
@@ -285,11 +287,11 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
 
   // ------------------------------------------------------------- route: which tools, from mode
   const route = routeFor(ctx, await spaceLookup);
-  const tools = toolsFor(route.tools);
+  const plan: ResearchPlan = { turn: 0, webSearches: 0, docSearches: 0, docHits: 0, pages: 0, fetchRounds: 0, saves: 0 };
 
-  // ------------------------------------------------------------- research: the loop
+  // ------------------------------------------------------------- research: at most two turns
   const messages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: RESEARCH_PROMPT(env.maxToolCalls, known, route) },
+    { role: 'system', content: RESEARCH_PROMPT(known, route) },
     ...history,
     { role: 'user', content: query }
   ];
@@ -310,6 +312,7 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     run.searches += 1;
     if (cached) run.cacheHits += 1;
     retrieved = true;
+    plan.webSearches += 1;
     // Shown to the model as its own first call, so the conversation it continues is coherent.
     messages.push(
       {
@@ -327,7 +330,12 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     );
   }
 
-  for (let turn = 1; ; turn++) {
+  for (;;) {
+    plan.turn += 1;
+    // The plan decides what is still worth doing. When no retrieval tool is left, research
+    // is finished (terminated=done) — no model turn is spent just to hear "DONE".
+    const tools = offeredTools(route.tools, plan);
+    if (!tools.some((t) => t.function.name !== 'save_memory')) break;
     if (Date.now() >= deadline) {
       terminated = 'cap';
       break;
@@ -339,7 +347,7 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
       // mode docs is the user saying "answer from my documents": the first move is not the
       // model's to skip. After that it may search again or stop.
       tool_choice:
-        route.tools === 'docs' && turn === 1
+        route.tools === 'docs' && plan.turn === 1
           ? { type: 'function', function: { name: 'search_documents' } }
           : 'auto',
       temperature: 0
@@ -349,15 +357,21 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
     const requested = msg?.tool_calls ?? [];
     if (!msg || requested.length === 0) break; // the model has what it needs: done
 
+    // The plan's per-tool allowances come first: a call over its allowance (a second web
+    // search, a fifth page) is dropped before it runs. The hard cap is the backstop.
+    const allowed = withinAllowance(requested, plan);
+    if (allowed.length === 0) break;
     const room = env.maxToolCalls - toolCalls.length;
     if (room <= 0) {
       terminated = 'cap';
       break;
     }
-    const batch = requested.slice(0, room);
+    const batch = allowed.slice(0, room);
     const outcomes = await Promise.allSettled(batch.map((call) => runTool(call, ctx, tools)));
 
-    messages.push(msg);
+    // Only the calls that ran: every tool_call in history must have its tool reply.
+    messages.push({ ...msg, tool_calls: batch });
+    if (batch.some((c) => c.function.name === 'fetch_page')) plan.fetchRounds += 1;
     for (const [i, call] of batch.entries()) {
       const outcome = outcomes[i]!;
       const step = toolCalls.length + 1;
@@ -379,6 +393,13 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
       if (r.cached) run.cacheHits += 1;
       if (r.saved) saved.push(r.saved);
       if (r.searched || r.hits) retrieved = true;
+      if (name === 'web_search' && r.ok) plan.webSearches += 1;
+      if (name === 'fetch_page') plan.pages += 1;
+      if (name === 'search_documents') {
+        plan.docSearches += 1;
+        plan.docHits += r.hits?.length ?? 0;
+      }
+      if (name === 'save_memory' && r.ok) plan.saves += 1;
       run.embeddingTokens += r.embeddingTokens ?? 0;
       const page = r.page;
       if (page && !evidence.some((e) => e.kind === 'web' && e.page.url === page.url)) {
@@ -390,7 +411,7 @@ export async function runQuickAnswer(ctx: AskContext, sse: Sse, run: RunState): 
       messages.push({ role: 'tool', tool_call_id: call.id, content: r.forModel });
     }
 
-    if (batch.length < requested.length) {
+    if (batch.length < allowed.length) {
       terminated = 'cap';
       break;
     }
@@ -586,10 +607,68 @@ interface ToolOutcome {
   hits?: DocHit[];
 }
 
-function toolsFor(route: Route['tools']): ChatCompletionTool[] {
-  if (route === 'web') return QUICK_TOOLS;
-  const saveMemoryTool = QUICK_TOOLS.filter((t) => t.function.name === 'save_memory');
-  return route === 'docs' ? [SEARCH_DOCUMENTS_TOOL, ...saveMemoryTool] : [SEARCH_DOCUMENTS_TOOL, ...QUICK_TOOLS];
+/**
+ * Quick research is a bounded plan, not an open loop. An open loop let the model re-search
+ * the same Space seven times until the 8-call cap stopped it (A2, A3), and every reworded
+ * web search was a cache miss on a repeated question. So:
+ *
+ *   web_search        once per answer, the harness's first search included
+ *   fetch_page        one round, up to 4 pages, in parallel
+ *   search_documents  once; a second, reworded search only if the first found nothing
+ *   save_memory       once, on the first turn
+ *
+ * At most two model turns (search, then read), and the loop ends as soon as no retrieval
+ * tool is left to offer. The hard caps stay as the backstop; this plan never reaches them.
+ */
+export interface ResearchPlan {
+  turn: number;
+  webSearches: number;
+  docSearches: number;
+  docHits: number;
+  pages: number;
+  fetchRounds: number;
+  saves: number;
+}
+
+const MAX_PAGES = 4;
+/**
+ * Quick reads 2–4 pages in parallel and answers from the ones that arrive: one slow
+ * publisher should not hold the first token. The page that misses this is one failed step.
+ */
+const QUICK_FETCH_TIMEOUT_MS = 4_000;
+
+function tool(name: ToolName): ChatCompletionTool {
+  return name === 'search_documents' ? SEARCH_DOCUMENTS_TOOL : QUICK_TOOLS.find((t) => t.function.name === name)!;
+}
+
+function offeredTools(route: Route['tools'], p: ResearchPlan): ChatCompletionTool[] {
+  if (p.turn > 2) return [];
+  const web = route !== 'docs';
+  const docs = route !== 'web';
+  const names: ToolName[] = [];
+  if (docs && (p.docSearches === 0 || (p.docSearches === 1 && p.docHits === 0))) names.push('search_documents');
+  if (web && p.webSearches === 0) names.push('web_search');
+  if (web && p.webSearches > 0 && p.fetchRounds === 0) names.push('fetch_page');
+  if (p.turn === 1 && p.saves === 0) names.push('save_memory');
+  return names.map(tool);
+}
+
+/** The requested calls the plan still allows, in the order the model asked for them. */
+function withinAllowance(requested: ChatCompletionMessageToolCall[], p: ResearchPlan): ChatCompletionMessageToolCall[] {
+  const left: Partial<Record<string, number>> = {
+    web_search: 1 - p.webSearches,
+    fetch_page: MAX_PAGES - p.pages,
+    search_documents: 1,
+    save_memory: 1 - p.saves
+  };
+  return requested.filter((call) => {
+    const n = left[call.function.name];
+    // A tool the plan has no allowance for goes through, so runTool can refuse it visibly.
+    if (n === undefined) return true;
+    if (n <= 0) return false;
+    left[call.function.name] = n - 1;
+    return true;
+  });
 }
 
 /** `p. 14`, `§ Pricing`, `line 40`: how a document citation says where it is. */
@@ -658,7 +737,7 @@ async function runTool(
 
   if (call.function.name === 'fetch_page') {
     try {
-      const page = await fetchPage(String(input.url));
+      const page = await fetchPage(String(input.url), QUICK_FETCH_TIMEOUT_MS);
       return {
         ok: true,
         ms: Date.now() - t0,

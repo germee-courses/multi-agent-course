@@ -1,0 +1,21 @@
+# The jobs worker: the agent's code, started as the worker. Its own Railway service so a
+# 60-page PDF is parsed in a different process from the one streaming answers. No port, no
+# public domain. Same build as Dockerfile.agent; only the command differs.
+FROM node:20-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/contract/package.json packages/contract/
+COPY backend/agent/package.json backend/agent/
+COPY backend/gateway/package.json backend/gateway/
+COPY web/package.json web/
+RUN npm ci
+COPY packages/contract packages/contract
+COPY backend/agent backend/agent
+RUN npm run build -w @lumina/contract && npm run build -w @lumina/agent
+
+FROM node:20-slim
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build /app /app
+WORKDIR /app/backend/agent
+CMD ["node", "dist/worker.js"]

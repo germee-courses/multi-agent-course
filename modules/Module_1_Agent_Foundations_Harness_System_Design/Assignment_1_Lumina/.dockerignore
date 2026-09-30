@@ -1,0 +1,12 @@
+# Build context is the assignment root (the workspace). Keep it small, and keep secrets out:
+# provider keys reach Railway as service variables, never inside an image.
+.git
+**/node_modules
+**/dist
+web/dist
+.env
+.env.*
+runs
+*.log
+.DS_Store
+# reports/ is deliberately NOT ignored: the gateway image serves reports/report.json at /evals/report.json.

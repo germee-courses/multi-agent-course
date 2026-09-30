@@ -9,7 +9,7 @@ Lumina has the following components:
 1 database
 3 pieces of state
 
-There's a React UI that I will host on Vercel once deployed.  This talks to the Gateway.
+There's a React UI, deployed as its own service on Railway next to the Gateway, Agent and worker.  This talks to the Gateway.
 The Gateway is a public Express service that handles CORS, the X-User-Id check, the X-Request-Id, pino request logging, zod validation against `packages/contract`, the rate limit per user, and SSE pass-through.
 
 The Agent service has a loop with six tools, quick and deep search, memory, document retrieval, run logs, and the deep-search daily cap.  The jobs worker runs off the request thread, which is a separate `npm run worker` process.
@@ -89,5 +89,7 @@ The Gateway and Agent are separate as a requirement of the assignment.  The main
 Instead of adding a separate vector database, Atlas Vector Search keeps text, embedding, and page locator in one document, so when Lumina finds a chunk using vector search, it already has the information needed to create its citation.  However, Lumina has to work within the limits of the MongoDB Atlas M0 tier, with three search index limit, and 512 MB storage limit.  Again, Atlas Vector Search is eventually consistent, so newly stored chunks may not immediately appear to search.
 
 The trade-off for having two-tier search cache is not clear.  There are now two caches to keep consistent.  The MongoDB searchCache is clearly useful, because it survives restarts and is shared by all Agent instances.  I am not sure how much the in-process LRU adds, because each LRU only helps its own process, so with many Agent instances it helps less.  Both tiers are required, so I will keep both.
+
+Quick search follows a small fixed plan instead of an open loop: one web search, one round of 2–4 pages read in parallel, and one document search (a second only if the first found nothing), in at most two model turns.  With the open loop, the model sometimes searched the same documents seven times in a row until the 8-call cap stopped it, so 13 of 102 deployed runs ended as `cap` instead of `done`.  Reworded extra searches also missed the search cache on repeated questions (35% hit rate against a 50% target).  With the plan, a local test had 0 of 9 runs capped, answer p95 fell from 15.6 s to 9.0 s, and cost per quick answer from $0.0038 to $0.0017.  The trade-off: a quick answer cannot notice weak results and dig further on its own.  Deep search is where that happens, and a follow-up question is how a user asks for more.
 
 I did not add a re-rank step.  Hybrid search (vector + BM25, merged with RRF) already finds the right page in the top 5 for 29 of the 30 gold questions (recall@5 = 0.967, target 0.70).  A re-rank would add a model call to every question, making answers slower and more expensive, to fix at most one miss, and that miss came from the model rewording the question, not from bad ranking.  I would add re-ranking if recall@5 dropped below 0.70.

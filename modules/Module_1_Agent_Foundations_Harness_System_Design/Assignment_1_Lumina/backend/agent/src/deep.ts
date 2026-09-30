@@ -255,19 +255,21 @@ async function research(
     step('web_search', input, Date.now() - t0, true, `${s.reason} — ${results.length} result(s)${cached ? ' (cached)' : ''}`);
 
     // The best results no other sub-question has taken. Claimed synchronously, before the
-    // fetches start, so two parallel sub-questions never read the same page twice.
+    // fetches start, so two parallel sub-questions never read the same page twice. How many
+    // is planned, not cut: this sub-question's share of the budget was fixed before it ran,
+    // so a 5- or 6-part plan reads fewer pages each by design. Only the clock is a cap here.
+    const wanted = Math.min(env.deepFetchesPerSubQuestion, Math.max(0, budget - used));
+    if (Date.now() >= deadline) capped = true;
     const picks: string[] = [];
     for (const r of results) {
-      if (picks.length >= env.deepFetchesPerSubQuestion) break;
+      if (capped || picks.length >= wanted) break;
       if (claimed.has(r.url)) continue;
       claimed.add(r.url);
       picks.push(r.url);
     }
-    const allowed = Date.now() < deadline ? picks.slice(0, Math.max(0, budget - used)) : [];
-    if (allowed.length < picks.length) capped = true;
 
     const pages = await Promise.all(
-      allowed.map(async (url) => {
+      picks.map(async (url) => {
         const t1 = Date.now();
         try {
           const page = await fetchPage(url);

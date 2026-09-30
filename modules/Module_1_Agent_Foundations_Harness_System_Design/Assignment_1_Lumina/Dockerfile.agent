@@ -1,0 +1,23 @@
+# The agent service. PRIVATE on Railway: no public domain; the gateway reaches it at
+# http://<agent service>.railway.internal:8000. Built from the assignment root, because the
+# agent depends on the workspace's contract package. Dockerfile.worker is the same build.
+FROM node:20-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/contract/package.json packages/contract/
+COPY backend/agent/package.json backend/agent/
+COPY backend/gateway/package.json backend/gateway/
+COPY web/package.json web/
+RUN npm ci
+COPY packages/contract packages/contract
+COPY backend/agent backend/agent
+RUN npm run build -w @lumina/contract && npm run build -w @lumina/agent
+
+FROM node:20-slim
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build /app /app
+# Run logs land in /app/runs (ephemeral in a container); the `runs` collection is the durable copy.
+WORKDIR /app/backend/agent
+EXPOSE 8000
+CMD ["node", "dist/index.js"]

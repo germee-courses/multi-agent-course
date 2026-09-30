@@ -1,0 +1,15 @@
+# The Railway equivalent of vercel.json's SPA rewrite: /evals opened directly (the grader
+# does) is served index.html instead of a 404.
+server {
+  listen ${PORT};
+  root /usr/share/nginx/html;
+
+  location /assets/ {
+    try_files $uri =404;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+  }
+
+  location / {
+    try_files $uri /index.html;
+  }
+}
