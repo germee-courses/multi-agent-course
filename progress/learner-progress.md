@@ -85,11 +85,10 @@ Status values: not started · in progress · completed · needs review
 - Side questions covered: invoices → extract fields to a table + query, embeddings only for fuzzy questions; LUMINA memory types (working / thread / long-term; documents, cache, run logs are not memory); pgvector could hold long-term memory but the spec requires Atlas, and the post-filter trap applies there too.
 - Weak spot: recall@5 / what retrieval metrics mean — revisit in Module 3.
 
+- 2026-10-01: Deployed on Railway Singapore (web, gateway, agent, worker; agent/worker private). Eval vs deployed gateway: automated 73/85 (manual 15 left to grader — 0 there means "ungraded", not failed). Demo video recorded (Loom); report.json rebuilt with it and gateway redeployed — /evals/report.json now serves the video. Learner chose to keep the UI on Railway, not Vercel (deploy_docs says Vercel UI → may cost up to 5 pts; suggested flagging it in the submission message).
+
 ## Next step
-- Optional DESIGN.md: replace "not sure how much the in-process LRU adds" with the measured 0 ms (LRU) vs 30–50 ms (Mongo).
-- Re-run `npm run bench` AFTER the 6 h search-cache window from run 2 for an honest cache number. TTFT 2.5 s is still out of reach on this network — record honestly in DESIGN.md; deploying next to Atlas/OpenAI will help.
-- DESIGN.md in learner's voice: memory recall every answer; no re-rank (recall@5 0.97); rate limit on spend routes, in-process; deep cap UTC midnight, counted at start; /stats from the logs.
-- Deploy (Fly.io both services) → /fde-lumina-eval → demo video.
-- DESIGN.md (learner's voice): (1) recall_memory run by harness every answer; (2) why no re-rank step (small Space, RRF baseline, TTFT already over budget; revisit if recall@5 < 0.70).
-- Then step 8: deep search (plan_research + plan event before retrieval).
-- Optional later: Module 1 quiz; reconciliation agent build.
+- Submit: post the Railway web URL (+ /evals) with the note about Railway instead of Vercel.
+- Optional before submitting: E2 error rate 13.6% (> 1%) and A3 fetch_page thrash (6–14 in a row, cap 4); 202 p95 426 ms; deep-cap probe "terminated".
+- Then: Module 2 (Skills & Subagents). Optional: Module 1 quiz.
+- Weak spot to revisit in Module 3: recall@5 / retrieval metrics.
