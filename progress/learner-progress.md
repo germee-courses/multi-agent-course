@@ -87,8 +87,9 @@ Status values: not started · in progress · completed · needs review
 
 - 2026-10-01: Deployed on Railway Singapore (web, gateway, agent, worker; agent/worker private). Eval vs deployed gateway: automated 73/85 (manual 15 left to grader — 0 there means "ungraded", not failed). Demo video recorded (Loom); report.json rebuilt with it and gateway redeployed — /evals/report.json now serves the video. Learner chose to keep the UI on Railway, not Vercel (deploy_docs says Vercel UI → may cost up to 5 pts; suggested flagging it in the submission message).
 
+- 2026-10-01: /evals was failing the EvalsReport schema (kit bug: build-report.mjs wrote step error: null) — fixed, gateway redeployed, video renders. LUMINA SUBMITTED (Railway web URL). Agent/worker public domains (created by mistake) deleted; only web + gateway public; agent reached via railway.internal. Reports committed + pushed to germee.
+
 ## Next step
-- Submit: post the Railway web URL (+ /evals) with the note about Railway instead of Vercel.
-- Optional before submitting: E2 error rate 13.6% (> 1%) and A3 fetch_page thrash (6–14 in a row, cap 4); 202 p95 426 ms; deep-cap probe "terminated".
-- Then: Module 2 (Skills & Subagents). Optional: Module 1 quiz.
+- Module 2 (Skills & Subagents), build-along. Optional first: Module 1 quiz.
+- Tell instructor the 3 kit bugs: Vite root .env, db.ts closed-client cache, build-report.mjs null step errors.
 - Weak spot to revisit in Module 3: recall@5 / retrieval metrics.
