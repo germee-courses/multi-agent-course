@@ -33,6 +33,8 @@ The Agent holds provider keys, and calls the LLM, embedding, and search provider
 
 `plan_research` is removed from the tool list on quick runs instead of being stopped at the prompt.
 An explicit call of the `save_memory` tool writes to long-term memory.
+
+Recalling memory is done by the harness on every answer, not left to the model. If the model decided, it could skip checking memory whenever the question gives no hint, and the answers would not be consistent: a saved preference like "answer in Spanish" would be silently ignored.  Checking every time costs about 30 ms per answer, which is worth it.
 The jobs worker moves a document from pending to indexed, the upload handler stores the file, inserts the pending document and its job, and returns.
 
 ## Communication
@@ -64,6 +66,8 @@ For uploaded files, `spaces` organizes documents, and `documents` store metadata
 
 `requests` and `runs` are the durable record of the requests and answers.  The `/stats` numbers must reconcile with the logs, so I will compute `/stats` from these records.
 
+`/stats` is calculated from the run logs (today's `runs` rows) instead of keeping separate counters.  Two records of the same thing can drift apart: a counter could go up while a log write fails, or reset when the Agent restarts.  Adding up the logs means `/stats` always agrees with them, which the benchmark checks: in my test both showed 56 answers and $0.348.  The cost is a small database query each time `/stats` is opened, which is fine at this scale.
+
 A document that is being stored in MongoDB is not automatically searchable.  Since Atlas Search is eventually consistent, which means that there can be a short delay between writing a chunk to MongoDB, and that chunk becoming available to vector search.  The worker does a read-your-write probe, which searches the vector index to retrieve a chunk that it just wrote.  It marks that the document is indexed only after this succeeds.  If processing fails, it marks the document `failed` with an error instead of indexing a half-indexed document.
 
 The search cache has two tiers for external search results:
@@ -74,9 +78,9 @@ Cache entries are identified by a SHA-256 of the normalized query and search pro
 
 Run logs (`runs/<requestId>.json` locally, the `runs` collection when deployed) record how each AI run behaved, including tokens, wall-clock-time, cost, `depth` (quick or deep), how the run `terminated`, and every tool call whether it succeeded or failed.  These logs are not part of the user's actual product data.  They are evidence used by Lumina's quality gates to check if the system is behaving correctly.
 
-Two open implementation decisions:
-1. Where to store the rate-limit and daily deep-search counters (in-process is simplest, but breaks with more than one instance)
-2. When the "day" resets for `resetsAt`
+The rate limit (30 per minute per user) only counts the requests that cost money: asking a question (LLM + search) and uploading a file (embeddings).  Reading threads, memories or document status is free and is not counted.  The UI checks upload progress every 1.5 seconds, so counting everything would block users with 429 errors just for watching their upload.  The counter lives in the gateway's memory, which is fast and correct for one gateway.  With two gateways each keeps its own count, so a user could get 60 per minute.  If I scale out, I would move the counter to MongoDB or Redis so all gateways share it.
+
+The deep-search daily cap (5 per user) is enforced in the Agent, not the Gateway, because a cap belongs next to the spending: anything that reaches the Agent without going through the Gateway would skip a Gateway cap.  The day resets at midnight UTC, which is the `resetsAt` time in the 429.  A deep search counts the moment it starts, not when it finishes, because a run that fails half-way has already spent money.  Counting at the start also means six searches started at the same instant cannot all get through: in my test, six at once against a cap of 2 let exactly two in.
 
 ## Trade-offs
 
@@ -85,3 +89,5 @@ The Gateway and Agent are separate as a requirement of the assignment.  The main
 Instead of adding a separate vector database, Atlas Vector Search keeps text, embedding, and page locator in one document, so when Lumina finds a chunk using vector search, it already has the information needed to create its citation.  However, Lumina has to work within the limits of the MongoDB Atlas M0 tier, with three search index limit, and 512 MB storage limit.  Again, Atlas Vector Search is eventually consistent, so newly stored chunks may not immediately appear to search.
 
 The trade-off for having two-tier search cache is not clear.  There are now two caches to keep consistent.  The MongoDB searchCache is clearly useful, because it survives restarts and is shared by all Agent instances.  I am not sure how much the in-process LRU adds, because each LRU only helps its own process, so with many Agent instances it helps less.  Both tiers are required, so I will keep both.
+
+I did not add a re-rank step.  Hybrid search (vector + BM25, merged with RRF) already finds the right page in the top 5 for 29 of the 30 gold questions (recall@5 = 0.967, target 0.70).  A re-rank would add a model call to every question, making answers slower and more expensive, to fix at most one miss, and that miss came from the model rewording the question, not from bad ranking.  I would add re-ranking if recall@5 dropped below 0.70.

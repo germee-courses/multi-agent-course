@@ -81,7 +81,12 @@ Status values: not started · in progress · completed · needs review
 - 2026-09-30: SECOND BENCH (cache still warm from run 1 → cache 75% is inflated): deepCap429 ✓ now (6th deep → 429 + resetsAt). New misses: 202 p95 332 ms (only 4 uploads, so p95 = slowest; network) and deep/quick 1.75× on the cost question (4 sub-qs, some 403s). TTFT 24.4 s / answer 27.9 s — network was worse (idle search p95 28 s).
 - Fixes: DEEP_FETCHES_PER_SUB_QUESTION 3 → 4 (24-step budget still trims it for 5–6 sub-qs); upload writes GridFS file ‖ document row in parallel (GridFS id exists when the stream opens), job last → warm uploads 157–240 ms.
 
+- 2026-09-30: DESIGN.md notes added (learner reasoned each Socratically, Claude shaped the wording): (1) harness recalls memory every answer — model might skip it, preference silently ignored, ~30 ms; (2) no re-rank — recall@5 0.967, the one miss is query rewording; (3) rate limit counts spend routes only (UI polls 40/min), in-process → 2 gateways = 60/min, shared store if scaled; (4) deep cap in Agent (gateway can be bypassed), UTC midnight, counted at start (failed runs spent money; race test); (5) /stats from the logs (two records drift). Learner answered 1, 3, 4 correctly; needed the answer for 2 (recall@5 + re-rank explained with a librarian analogy) and 5.
+- Side questions covered: invoices → extract fields to a table + query, embeddings only for fuzzy questions; LUMINA memory types (working / thread / long-term; documents, cache, run logs are not memory); pgvector could hold long-term memory but the spec requires Atlas, and the post-filter trap applies there too.
+- Weak spot: recall@5 / what retrieval metrics mean — revisit in Module 3.
+
 ## Next step
+- Optional DESIGN.md: replace "not sure how much the in-process LRU adds" with the measured 0 ms (LRU) vs 30–50 ms (Mongo).
 - Re-run `npm run bench` AFTER the 6 h search-cache window from run 2 for an honest cache number. TTFT 2.5 s is still out of reach on this network — record honestly in DESIGN.md; deploying next to Atlas/OpenAI will help.
 - DESIGN.md in learner's voice: memory recall every answer; no re-rank (recall@5 0.97); rate limit on spend routes, in-process; deep cap UTC midnight, counted at start; /stats from the logs.
 - Deploy (Fly.io both services) → /fde-lumina-eval → demo video.
