@@ -13,7 +13,7 @@
 
 | Module | Status | Notes / weak spots |
 |--------|--------|--------------------|
-| 01 — Agent Foundations, Agent Harness & System Design | in progress | Core concepts done (agent, loop/ReAct, stop_reason, harness, levels) via running example: Excel reconciliation agent. Strong — independently reasoned that the LLM only needs schema/samples while a script does the matching (context management). Skipped: exercises, quiz. |
+| 01 — Agent Foundations, Agent Harness & System Design | in progress | Core concepts done (agent, loop/ReAct, stop_reason, harness, levels) via running example: Excel reconciliation agent. Strong — independently reasoned that the LLM only needs schema/samples while a script does the matching (context management). Quiz done 2026-10-01: 4/4 (1 first try, 3 after one hint). Skipped: exercises. |
 | 02 — Skills & Subagents: Product Architecture & Coordination | not started | |
 | 03 — Production Agentic RAG & AI Systems | not started | |
 | 04 — Multi-Agent Systems & Orchestration | not started | |
@@ -24,7 +24,7 @@
 Status values: not started · in progress · completed · needs review
 
 ## Weak spots to revisit
-- [none yet]
+- Module 1 quiz (2026-10-01): mixed up 'harness' with the four architecture levels (L1 LLM / L2 +tools / L3 reasoning / L4 agent-to-agent) — got L3 after the list; harness role first answered as 'has tools + memory', needed the hint for runs-the-loop + enforces caps/stop. Agent-loop order: put feed-back after repeat at first.
 
 ## LUMINA setup (done 2026-09-25)
 - Atlas M0 (Hong Kong region — watch latency vs 2.5s TTFT), indexes created, 3/3 search indexes (sample_mflix dropped to free the slot).
@@ -90,6 +90,6 @@ Status values: not started · in progress · completed · needs review
 - 2026-10-01: /evals was failing the EvalsReport schema (kit bug: build-report.mjs wrote step error: null) — fixed, gateway redeployed, video renders. LUMINA SUBMITTED (Railway web URL). Agent/worker public domains (created by mistake) deleted; only web + gateway public; agent reached via railway.internal. Reports committed + pushed to germee.
 
 ## Next step
-- Module 2 (Skills & Subagents), build-along. Optional first: Module 1 quiz.
+- Module 2 (Skills & Subagents), build-along. Open warm-up question: why hand deep-search sub-questions to subagents (own context) instead of code fan-out, and what does it cost?
 - Tell instructor the 3 kit bugs: Vite root .env, db.ts closed-client cache, build-report.mjs null step errors.
 - Weak spot to revisit in Module 3: recall@5 / retrieval metrics.
