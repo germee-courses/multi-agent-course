@@ -155,7 +155,7 @@ function readTrajectory(requestId, label) {
       tool: t.name,
       ok: t.ok !== false,
       ms: t.ms,
-      error: t.error
+      error: t.error ?? undefined // contract: optional string, never null
     })),
     notes:
       val(`${label}-notes`) ??
