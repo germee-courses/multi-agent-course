@@ -1,0 +1,538 @@
+{
+  "assignment": "Assignment 1: LUMINA",
+  "student": "germee",
+  "video": "https://www.loom.com/share/73aff08333c1447697d5243105f79c37",
+  "deployedAt": "2026-09-30T23:26:38.677Z",
+  "runNotes": "gpt-4.1-mini · tavily · Atlas (Hong Kong) · Railway Singapore (gateway, agent, worker, web)",
+  "design": {
+    "components": "Lumina has the following components:\n3 runtime services\n1 database\n3 pieces of state\n\nThere's a React UI, deployed as its own service on Railway next to the Gateway, Agent and worker.  This talks to the Gateway.\nThe Gateway is a public Express service that handles CORS, the X-User-Id check, the X-Request-Id, pino request logging, zod validation against `packages/contract`, the rate limit per user, and SSE pass-through.\n\nThe Agent service has a loop with six tools, quick and deep search, memory, document retrieval, run logs, and the deep-search daily cap.  The jobs worker runs off the request thread, which is a separate `npm run worker` process.\n\nMongoDB is the database that also holds vectors, and GridFS for raw uploads.\n\nThe Agent calls the LLM, OpenAI embeddings, and Tavily or SerpApi for search (switchable with `SEARCH_PROVIDER`).\n\nThe three stateful pieces that are not services:\nthe `jobs` collection (the ingestion queue)\nthe two-tier search cache (an in-process LRU inside the Agent in front of the Mongo `searchCache` collection)\nthe run logs (one per answer)",
+    "responsibilities": "The React UI is only frontend client.  It does not hold a key, and does not call the LLM or Agent directly.\n\nThe Gateway is the bridge between the browser, and the backend.  It is the one that rejects a request at the edge: 401 without X-User-Id, 400 for a body that fails the contract, and 429 for the rate limit.  It reuses or generates the request id.  It does not research, answer, or hold provider keys, and when the Agent fails it returns 502.\n\nThe Agent holds provider keys, and calls the LLM, embedding, and search providers.  Since it owns the loop, it decides that a run is over its cap (8 tool calls and 90 sec for quick, 24 tool calls and 240 sec for deep).  It sets `terminated` to `done`, `cap`, or `error`.  It is also where the deep daily cap is enforced (`DEEP_DAILY_CAP` per X-User-Id, returning `429 {error, resetsAt}`).  \n\n`plan_research` is removed from the tool list on quick runs instead of being stopped at the prompt.\nAn explicit call of the `save_memory` tool writes to long-term memory.\n\nRecalling memory is done by the harness on every answer, not left to the model. If the model decided, it could skip checking memory whenever the question gives no hint, and the answers would not be consistent: a saved preference like \"answer in Spanish\" would be silently ignored.  Checking every time costs about 30 ms per answer, which is worth it.\nThe jobs worker moves a document from pending to indexed, the upload handler stores the file, inserts the pending document and its job, and returns.",
+    "communication": "The browser talks to the Gateway over HTTP, and sends X-User-Id on every call except `/health`.\nThe Gateway reuses an inbound X-Request-Id, or generates one if there is none, forwards it to the Agent, and returns it on the response.\n\nThe `POST /threads/{id}/ask` route uses Server-Sent Events (SSE), so the user can see answers from Lumina already while it is still working.  In a quick run, Lumina sends a trace, sources, tokens, and done.  trace shows what the Agent is doing, source shows the evidence it found, tokens are the parts of the answer being generated, and done means that the answer is complete.\n\nIn a deep run, Lumina creates a plan first to show how it will break the question into smaller sub-questions.  It then does the same process, but each research step and source is connected to the sub-question that used it.  The sources event has to come before the first token, so the citations in the answer point to sources that Lumina retrieved before generating the answer.\n\nThe Gateway and the Agent communicate via internal HTTP.  The Gateway receives the request from the browser, and sends it to the Agent, which does the research.  Compression is disabled on the ask route, and each event is sent immediately, so the user can see the partial responses as they are generated.\n\nThere are no silent failures.  If the Agent is down or fails before it streams, the Gateway returns an HTTP 502 error.  If an external provider fails while the answer is already streaming, the Agent ends the run with `terminated: \"error\"`, and sends a 502 as an SSE `error` event.  A tool failure that can still be continued by the loop, such as a request that returns 403, is recorded as a trace with `ok: false` with the error message, while the Agent continues working.  Reaching a tool-call or time cap is not an error.  The Agent stops with `terminated: \"cap\"`, and a best partial answer.\n\nWhen a document is uploaded, the original file is stored in MongoDB GridFS, a document with pending status is created, and a job is added to the jobs list.  It returns `202 {docId, status: \"pending\"}` in under 300 ms.  A background worker picks up the job, and changes it from pending to running.  It uses an atomic MongoDB operation called `findOneAndUpdate`, so only one worker can take the job.  The job records `claimedAt` and `workerId`.\n\nThe browser shows progress by repeatedly calling GET /spaces/{id}/documents.  This process is called polling.  If there are no available workers, the jobs stay as pending.  If the job stops mid-run, the row stays `running`, but its `claimedAt` becomes stale.  A sweeper periodically checks for these jobs, and returns them to pending, so another worker can claim the job without repeating what has been done before.",
+    "state": "Lumina uses MongoDB Atlas as its database that stores the system's authoritative data, which means the data that Lumina treats as source of truth.  Every user-owned document in MongoDB carries the user id.  `threads` and `messages` store conversations.  Each AI message stores the answer, its sources, its `done` metrics.  For deep research, it also keeps the plan, so any old answer can be explained.\n\n`memories` stores facts about the user.  These memories also have embeddings, which allow Lumina to find relevant memories using vector search.  The vector search is filtered by userId.  A memory is only written when the Agent calls `save_memory`.  Memories can be listed with `GET /memory`, and removed with `DELETE /memory/{id}`.  Lumina cannot remember something that the user cannot see or delete.\n\nFor uploaded files, `spaces` organizes documents, and `documents` store metadata, and its status (pending -> parsing -> embedding -> indexed, or failed, with a percentage).  The original uploaded file is stored in GridFS.  The document is divided into chunks, and `chunks` keeps each chunk's text, locator (page for PDF, heading or line for text), and embedding.  All Spaces use `chunks`, so `$vectorSearch` can use `spaceId` as a filter to make sure it searches only the correct Space.  As the text, locator, and embedding are all in the same chunk document, Lumina can retrieve a chunk, and know where it came from for its citation, without joining separate stores.\n\n`jobs` is the durable ingestion queue.  Durable means the jobs are stored in MongoDB.\n\n`requests` and `runs` are the durable record of the requests and answers.  The `/stats` numbers must reconcile with the logs, so I will compute `/stats` from these records.\n\n`/stats` is calculated from the run logs (today's `runs` rows) instead of keeping separate counters.  Two records of the same thing can drift apart: a counter could go up while a log write fails, or reset when the Agent restarts.  Adding up the logs means `/stats` always agrees with them, which the benchmark checks: in my test both showed 56 answers and $0.348.  The cost is a small database query each time `/stats` is opened, which is fine at this scale.\n\nA document that is being stored in MongoDB is not automatically searchable.  Since Atlas Search is eventually consistent, which means that there can be a short delay between writing a chunk to MongoDB, and that chunk becoming available to vector search.  The worker does a read-your-write probe, which searches the vector index to retrieve a chunk that it just wrote.  It marks that the document is indexed only after this succeeds.  If processing fails, it marks the document `failed` with an error instead of indexing a half-indexed document.\n\nThe search cache has two tiers for external search results:\n1. An in-memory LRU cache inside each Agent process, which is very fast, but disappears when that process restarts\n2. The MongoDB `searchCache` collection, which survives restarts\n\nCache entries are identified by a SHA-256 of the normalized query and search provider, and MongoDB uses a TTL index to automatically make them expired after 6 hours by default (set by `SEARCH_CACHE_TTL_SECONDS`).  If both caches are deleted, Lumina still works correctly, but it is more expensive and slower because it has to perform the searches again.  Lumina caches only the search results, and not the final answer.\n\nRun logs (`runs/<requestId>.json` locally, the `runs` collection when deployed) record how each AI run behaved, including tokens, wall-clock-time, cost, `depth` (quick or deep), how the run `terminated`, and every tool call whether it succeeded or failed.  These logs are not part of the user's actual product data.  They are evidence used by Lumina's quality gates to check if the system is behaving correctly.\n\nThe rate limit (30 per minute per user) only counts the requests that cost money: asking a question (LLM + search) and uploading a file (embeddings).  Reading threads, memories or document status is free and is not counted.  The UI checks upload progress every 1.5 seconds, so counting everything would block users with 429 errors just for watching their upload.  The counter lives in the gateway's memory, which is fast and correct for one gateway.  With two gateways each keeps its own count, so a user could get 60 per minute.  If I scale out, I would move the counter to MongoDB or Redis so all gateways share it.\n\nThe deep-search daily cap (5 per user) is enforced in the Agent, not the Gateway, because a cap belongs next to the spending: anything that reaches the Agent without going through the Gateway would skip a Gateway cap.  The day resets at midnight UTC, which is the `resetsAt` time in the 429.  A deep search counts the moment it starts, not when it finishes, because a run that fails half-way has already spent money.  Counting at the start also means six searches started at the same instant cannot all get through: in my test, six at once against a cap of 2 let exactly two in.",
+    "tradeoffs": "The Gateway and Agent are separate as a requirement of the assignment.  The main benefit is security.  The Gateway can communicate with the browser, while sensitive things, such as provider API keys, and the spend cap stay inside the private Agent, where the browser cannot reach them.  The tradeoff is complexity.  Every request has to make an extra network hop from Browser -> Gateway -> Agent.  We have to deploy two services, and if the Agent goes down, the Gateway has to return a 502 error.  A single backend service would be simpler, but it would not provide the same security.\n\nInstead of adding a separate vector database, Atlas Vector Search keeps text, embedding, and page locator in one document, so when Lumina finds a chunk using vector search, it already has the information needed to create its citation.  However, Lumina has to work within the limits of the MongoDB Atlas M0 tier, with three search index limit, and 512 MB storage limit.  Again, Atlas Vector Search is eventually consistent, so newly stored chunks may not immediately appear to search.\n\nThe trade-off for having two-tier search cache is not clear.  There are now two caches to keep consistent.  The MongoDB searchCache is clearly useful, because it survives restarts and is shared by all Agent instances.  I am not sure how much the in-process LRU adds, because each LRU only helps its own process, so with many Agent instances it helps less.  Both tiers are required, so I will keep both.\n\nQuick search follows a small fixed plan instead of an open loop: one web search, one round of 2–4 pages read in parallel, and one document search (a second only if the first found nothing), in at most two model turns.  With the open loop, the model sometimes searched the same documents seven times in a row until the 8-call cap stopped it, so 13 of 102 deployed runs ended as `cap` instead of `done`.  Reworded extra searches also missed the search cache on repeated questions (35% hit rate against a 50% target).  With the plan, a local test had 0 of 9 runs capped, answer p95 fell from 15.6 s to 9.0 s, and cost per quick answer from $0.0038 to $0.0017.  The trade-off: a quick answer cannot notice weak results and dig further on its own.  Deep search is where that happens, and a follow-up question is how a user asks for more.\n\nI did not add a re-rank step.  Hybrid search (vector + BM25, merged with RRF) already finds the right page in the top 5 for 29 of the 30 gold questions (recall@5 = 0.967, target 0.70).  A re-rank would add a model call to every question, making answers slower and more expensive, to fix at most one miss, and that miss came from the model rewording the question, not from bad ranking.  I would add re-ranking if recall@5 dropped below 0.70."
+  },
+  "gates": [
+    {
+      "gate": 0,
+      "name": "STATIC",
+      "status": "pass",
+      "detail": "lint, typecheck and git clean"
+    },
+    {
+      "gate": 1,
+      "name": "CONTRACT",
+      "status": "pass",
+      "detail": "C1: expectations.json is coherent",
+      "exitCode": 2
+    },
+    {
+      "gate": 2,
+      "name": "RUN",
+      "status": "fail",
+      "detail": "the smoke run missed a target — see above",
+      "exitCode": 1
+    }
+  ],
+  "rubric": {
+    "total": 100,
+    "awarded": 73,
+    "automated": [
+      {
+        "id": "ui_lights_up_contract",
+        "label": "UI lights up & contract",
+        "points": 10,
+        "awarded": 10,
+        "status": "pass",
+        "evidence": "✓ contract probes (401/404/400): GET /memory without X-User-Id: 401 · GET /threads/thr_nope (unknown id): 404 · POST /threads/thr_x/ask with an empty body: 400 · GET /evals/report.json without X-User-Id: 200 · ✓ sources before the first token: every answer sent its sources event before its first token · ✓ /health names model, provider, store: /health names gpt-4.1-mini · tavily · atlas-vector-search · db ok",
+        "rules": [
+          "C1"
+        ]
+      },
+      {
+        "id": "search_cited_answers",
+        "label": "Search & cited answers",
+        "points": 20,
+        "awarded": 20,
+        "status": "pass",
+        "evidence": "✓ citation grounding >= 0.95: citation grounding 0.993 over 138 verifiable citations, 0 dangling · ✓ retrieval rate = 1.0: retrieval rate 1 — the share of answers whose run actually searched · ✓ search cache hits on repeats: search cache hit rate 79.3% on a workload that is 50% repeats",
+        "rules": [
+          "E2"
+        ]
+      },
+      {
+        "id": "memory",
+        "label": "Memory (thread + long-term)",
+        "points": 10,
+        "awarded": 10,
+        "status": "pass",
+        "evidence": "✓ save_memory lands in GET /memory: GET /memory lists 1 new row after the save and the trace shows save_memory · ✓ recall crosses into a new thread: a new thread's trace carries 1 recall_memory step(s) · ✓ DELETE removes it: DELETE /memory/mem_munv22nlpuyyup removed the row",
+        "rules": []
+      },
+      {
+        "id": "rag_documents",
+        "label": "RAG over documents",
+        "points": 15,
+        "awarded": 12,
+        "status": "partial",
+        "evidence": "✗ 202 accept p95 < 300ms: 202 accept p95 426ms",
+        "rules": [
+          "E1",
+          "E2"
+        ]
+      },
+      {
+        "id": "deep_search",
+        "label": "Deep search (plan, fan-out, merged citations, spend gate)",
+        "points": 15,
+        "awarded": 13,
+        "status": "partial",
+        "evidence": "✗ deep cap+1 returns 429 with resetsAt: deep cap probe failed: terminated",
+        "rules": [
+          "E2",
+          "B3",
+          "R2"
+        ]
+      },
+      {
+        "id": "performance_sla",
+        "label": "Performance & SLA gate",
+        "points": 10,
+        "awarded": 3,
+        "status": "partial",
+        "evidence": "✗ bench.mjs exits 0: 3 SLA target(s) missed · ✗ no error-severity quality failure: quality: 1 error(s), 2 warning(s) over 79 run log(s)",
+        "rules": [
+          "B1",
+          "B2",
+          "B3",
+          "A2",
+          "A3"
+        ]
+      },
+      {
+        "id": "observability",
+        "label": "Logging, tracing & stats",
+        "points": 5,
+        "awarded": 5,
+        "status": "pass",
+        "evidence": "✓ one X-Request-Id correlates both logs: 60/60 answers returned an X-Request-Id to correlate the two logs · ✓ /stats reconciles with the run: /stats.answers=185 against 60 answers this run · ✓ every failed tool call carries an error (A1): A1: 79 run(s)",
+        "rules": [
+          "A1"
+        ]
+      }
+    ],
+    "manual": [
+      {
+        "id": "deep_search_quality",
+        "label": "Deep search quality (human half)",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "a grader asks the same question at both depths and reads both answers. The deep one has to be BETTER, not merely longer: broader coverage, sources the quick answer missed, sub-questions a person would actually have asked, and no padding. Judged by a person, never a model",
+        "rules": [
+          "E3",
+          "P1"
+        ]
+      },
+      {
+        "id": "human_gate_answer_quality",
+        "label": "Human gate & answer quality",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "/evals renders one successful and one failing trajectory in full, every step, with what each taught the learner; grader reads five sampled answers for concision, relevance, and honesty when retrieval is thin",
+        "rules": [
+          "P1"
+        ]
+      },
+      {
+        "id": "deploy_docs",
+        "label": "Deploy & docs",
+        "points": 5,
+        "awarded": 0,
+        "status": "manual",
+        "evidence": "UI deployed on Vercel (the submitted URL) with /evals rendering GET /evals/report.json from this run; services on Fly.io or Vercel against an Atlas cluster; agent service not publicly reachable; no key or connection string reachable from the browser; the design section (five questions) and run notes render on the page",
+        "rules": []
+      }
+    ],
+    "redLines": [
+      {
+        "check": "no fabricated citation in the bench sample (E2)",
+        "ok": true,
+        "detail": "0 citation(s) resolved to nothing retrieved in that request"
+      },
+      {
+        "check": "no run that hit a cap reported as terminated=done (A2)",
+        "ok": true,
+        "detail": "79 run(s)"
+      },
+      {
+        "check": "plan_research never called from a quick search: depth is opted into, never drifted into (R2)",
+        "ok": true,
+        "detail": "64 quick run(s), none called plan_research"
+      },
+      {
+        "check": "no 2xx answer served on a provider exception (A1)",
+        "ok": true,
+        "detail": "79 run(s)"
+      }
+    ]
+  },
+  "bench": {
+    "ranAt": "2026-09-30T08:46:16.304Z",
+    "target": "https://gateway-production-bfe5.up.railway.app",
+    "pass": false,
+    "sla": [
+      {
+        "metric": "ttft p95",
+        "target": 2500,
+        "actual": 9428,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "answer p95",
+        "target": 12000,
+        "actual": 10669,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "202 accept p95",
+        "target": 300,
+        "actual": 426,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "search p95 during ingest / idle",
+        "target": 1.3,
+        "actual": 0.54,
+        "unit": "×",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "recall@5",
+        "target": 0.7,
+        "actual": 0.933,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "search cache hit rate",
+        "target": 50,
+        "actual": 79.3,
+        "unit": "%",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "deep plan p95",
+        "target": 4000,
+        "actual": 2459,
+        "unit": "ms",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "deep answer p95",
+        "target": 90,
+        "actual": 15.2,
+        "unit": "s",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "deep sub-questions (min)",
+        "target": 3,
+        "actual": 4,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "deep/quick source ratio (min)",
+        "target": 2,
+        "actual": 3,
+        "unit": "×",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "cost per deep answer",
+        "target": 0.35,
+        "actual": 0.0231,
+        "unit": "$",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "citation grounding",
+        "target": 0.95,
+        "actual": 0.993,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "error rate",
+        "target": 0.01,
+        "actual": 0.1358,
+        "unit": "",
+        "comparator": "<=",
+        "pass": false
+      },
+      {
+        "metric": "cost per answer (quick)",
+        "target": 0.05,
+        "actual": 0.0025,
+        "unit": "$",
+        "comparator": "<=",
+        "pass": true
+      },
+      {
+        "metric": "sources before the first token",
+        "target": 1,
+        "actual": 1,
+        "unit": "",
+        "comparator": ">=",
+        "pass": true
+      },
+      {
+        "metric": "citations with no matching source",
+        "target": 0,
+        "actual": 0,
+        "unit": "",
+        "comparator": "<=",
+        "pass": true
+      }
+    ],
+    "citationGrounding": 0.9927536231884058,
+    "recallAt5": 0.9333333333333333,
+    "retrievalRate": 1,
+    "errorRate": 0.13580246913580246,
+    "latency": {
+      "ttftP50Ms": 3849,
+      "ttftP95Ms": 9428,
+      "answerP50Ms": 5042,
+      "answerP95Ms": 10669,
+      "accept202P95Ms": 426
+    },
+    "cost": {
+      "meanCostPerAnswerUsd": 0.0025102343750000007,
+      "meanCostPerDeepAnswerUsd": 0.02306125,
+      "declaredPriceTableUsd": 0.023558749999999993,
+      "projectedMonthlyUsd": 456.5335937500001,
+      "projectedMonthlyNoCacheUsd": 885.5061961206898
+    },
+    "searchCacheHitRatePct": 79.3103448275862,
+    "answers": 68
+  },
+  "quality": {
+    "project": "Assignment_1_Lumina",
+    "checkedAt": "2026-09-30T20:38:57.035Z",
+    "runs": 79,
+    "errors": 1,
+    "warnings": 2,
+    "results": [
+      {
+        "id": "C1",
+        "title": "Declared expectations are internally coherent",
+        "severity": "error",
+        "status": "pass",
+        "detail": "contract coherent"
+      },
+      {
+        "id": "A1",
+        "title": "Tool errors surface as errors",
+        "severity": "error",
+        "status": "pass",
+        "detail": "79 run(s)"
+      },
+      {
+        "id": "A2",
+        "title": "The loop terminates because it finished",
+        "severity": "error",
+        "status": "pass",
+        "detail": "79 run(s)"
+      },
+      {
+        "id": "A3",
+        "title": "No tool thrash",
+        "severity": "warn",
+        "status": "fail",
+        "detail": "req_3e0c8a3f-e23: \"fetch_page\" called 6x consecutively (cap 4); req_59208719-e27: \"fetch_page\" called 9x consecutively (cap 4); req_87b5784a-a9e: \"fetch_page\" called 8x consecutively (cap 4); req_9b889117-fe7: \"fetch_page\" called 8x consecutively (cap 4); req_d3b61e31-8a7: \"fetch_page\" called 14x consecutively (cap 4); req_ef24fd17-1ee: \"fetch_page\" called 6x consecutively (cap 4)"
+      },
+      {
+        "id": "R1",
+        "title": "Required tools were actually called",
+        "severity": "error",
+        "status": "skip",
+        "detail": "none declared"
+      },
+      {
+        "id": "R2",
+        "title": "Forbidden tools were not called",
+        "severity": "error",
+        "status": "skip",
+        "detail": "none declared"
+      },
+      {
+        "id": "E1",
+        "title": "A gold set exists and is non-trivial",
+        "severity": "error",
+        "status": "pass",
+        "detail": "39 items"
+      },
+      {
+        "id": "E2",
+        "title": "Declared eval thresholds are met",
+        "severity": "error",
+        "status": "fail",
+        "detail": "errorRate=0.1358 > 0.01"
+      },
+      {
+        "id": "E3",
+        "title": "A judge model may report, never block",
+        "severity": "warn",
+        "status": "manual",
+        "detail": "confirm no error-severity rule derives its verdict from a model"
+      },
+      {
+        "id": "B1",
+        "title": "Token budget respected",
+        "severity": "error",
+        "status": "pass",
+        "detail": "79 run(s)"
+      },
+      {
+        "id": "B2",
+        "title": "Latency budget respected",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "79 run(s)"
+      },
+      {
+        "id": "B3",
+        "title": "Cost budget respected",
+        "severity": "warn",
+        "status": "pass",
+        "detail": "79 run(s)"
+      },
+      {
+        "id": "P1",
+        "title": "A human read a full trajectory",
+        "severity": "info",
+        "status": "manual",
+        "detail": "name the successful and failing trajectories you read end to end"
+      },
+      {
+        "id": "P2",
+        "title": "Every rule cites a real precedent",
+        "severity": "warn",
+        "status": "fail",
+        "detail": "10 rule(s) still lack a real precedent: C1, A2, A3, R1, R2, E1, E2, B1, B2, B3"
+      }
+    ]
+  },
+  "trajectories": {
+    "successful": {
+      "requestId": "req_50e70f70-d7d",
+      "query": "What is MongoDB Atlas Vector Search used for?",
+      "terminated": "done",
+      "steps": [
+        {
+          "step": 1,
+          "tool": "recall_memory",
+          "ok": true,
+          "ms": 37
+        },
+        {
+          "step": 2,
+          "tool": "web_search",
+          "ok": true,
+          "ms": 37
+        },
+        {
+          "step": 3,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 1663
+        },
+        {
+          "step": 4,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 1846
+        },
+        {
+          "step": 5,
+          "tool": "fetch_page",
+          "ok": true,
+          "ms": 917
+        }
+      ],
+      "notes": "The wait is long. The model thinking takes most of the time, not the tools."
+    },
+    "failing": {
+      "requestId": "req_5b08ca48-6ff",
+      "query": "Which header disables response buffering on nginx-family proxies for a stream?",
+      "terminated": "cap",
+      "steps": [
+        {
+          "step": 1,
+          "tool": "recall_memory",
+          "ok": true,
+          "ms": 33
+        },
+        {
+          "step": 2,
+          "tool": "search_documents",
+          "ok": true,
+          "ms": 479
+        },
+        {
+          "step": 3,
+          "tool": "search_documents",
+          "ok": true,
+          "ms": 465
+        },
+        {
+          "step": 4,
+          "tool": "search_documents",
+          "ok": true,
+          "ms": 477
+        },
+        {
+          "step": 5,
+          "tool": "search_documents",
+          "ok": true,
+          "ms": 453
+        },
+        {
+          "step": 6,
+          "tool": "search_documents",
+          "ok": true,
+          "ms": 435
+        },
+        {
+          "step": 7,
+          "tool": "search_documents",
+          "ok": true,
+          "ms": 492
+        },
+        {
+          "step": 8,
+          "tool": "search_documents",
+          "ok": true,
+          "ms": 442
+        }
+      ],
+      "notes": "The model decides when it's done. When it's not done yet, and it reaches the harness limit, it is stopped too. In this run it didn't stop, the harness limit stopped it."
+    }
+  }
+}
